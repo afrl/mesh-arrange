@@ -240,6 +240,11 @@ if(MESHARRANGE_INSTALL)
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/MeshArrange
     )
 
+    export(EXPORT MeshArrangeTargets
+        FILE "${CMAKE_CURRENT_BINARY_DIR}/MeshArrangeTargets.cmake"
+        NAMESPACE MeshArrange::
+    )
+
     configure_package_config_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/MeshArrangeConfig.cmake.in"
         "${CMAKE_CURRENT_BINARY_DIR}/MeshArrangeConfig.cmake"
