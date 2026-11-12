@@ -8,6 +8,8 @@
 #include <map>
 #include <memory>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -102,11 +104,20 @@ struct MockDiscreteEdge : MockGEntity
 struct MockDiscreteFace : MockGEntity
 {
     std::vector<int> bound_edge_tags;
+    std::vector<int> bound_edge_dirs;
+    std::vector<MockDiscreteEdge*> embedded_edges;
+    std::vector<MockDiscreteVertex*> embedded_vertices;
     std::vector<MockMVertex*> mesh_vertices;
     std::vector<MockMTriangle*> triangles;
 
     MockDiscreteFace(MockGModel*, int t) { tag = t; }
-    void setBoundEdges(const std::vector<int>& tags) { bound_edge_tags = tags; }
+    void setBoundEdges(const std::vector<int>& tags, const std::vector<int>& dirs)
+    {
+        bound_edge_tags = tags;
+        bound_edge_dirs = dirs;
+    }
+    void addEmbeddedEdge(MockDiscreteEdge* ge) { embedded_edges.push_back(ge); }
+    void addEmbeddedVertex(MockDiscreteVertex* gv) { embedded_vertices.push_back(gv); }
 
     ~MockDiscreteFace() override
     {
@@ -260,17 +271,33 @@ int main()
     }
 
     // 2. Run full overlap-removing arrangement using ONLY the custom PlcTetrahedralizerFn
+    //    and verify LogCallback captures messages cleanly without touching stdout.
+    std::vector<std::pair<LogLevel, std::string>> captured_logs;
     ArrangeOptions opts;
     opts.remove_overlaps     = true;
+    opts.verbose             = true;
     opts.check_topology      = true;
     opts.plc_tetrahedralizer = slab_star_plc_tetrahedralizer;
+    opts.log_callback        = [&](LogLevel lvl, const std::string& msg)
+    {
+        captured_logs.emplace_back(lvl, msg);
+    };
 
     const auto res = arrange_surfaces({ box_a, box_b }, opts);
+    TEST_CHECK(!captured_logs.empty());
     TEST_CHECK(res.constituent_surfaces.size() == 2);
     TEST_CHECK(res.brep_volumes.size() == 2);
     TEST_CHECK(!res.brep_faces.empty());
     TEST_CHECK(!res.brep_curves.empty());
     TEST_CHECK(!res.brep_vertices.empty());
+
+    // Verify thread_local GlobalOptions isolation
+    GlobalOptions::get().output_dir = "/tmp/main_thread_dir";
+    std::string worker_default_dir;
+    std::thread worker([&]() { worker_default_dir = GlobalOptions::get().output_dir; });
+    worker.join();
+    TEST_CHECK(worker_default_dir == ".");
+    GlobalOptions::get().output_dir = ".";
 
     // 3. Populate mock Gmsh discrete GModel via populate_gmsh_discrete_model
     MockGModel model;
@@ -288,6 +315,30 @@ int main()
     TEST_CHECK(mapping.faces.size() == res.brep_faces.size());
     TEST_CHECK(mapping.regions.size() == res.brep_volumes.size());
     TEST_CHECK(model.regions.size() == 2);
+
+    // Verify 2-argument setBoundEdges(tags, dirs): positive tags, +-1 signs, and closed 1-cycles (d(dF) = 0)
+    for (const auto& gf : model.faces)
+    {
+        TEST_CHECK(gf->bound_edge_tags.size() == gf->bound_edge_dirs.size());
+        std::map<const MockDiscreteVertex*, int> vertex_boundary_flux;
+        for (std::size_t i = 0; i < gf->bound_edge_tags.size(); ++i)
+        {
+            const int etag = gf->bound_edge_tags[i];
+            const int edir = gf->bound_edge_dirs[i];
+            TEST_CHECK(etag >= 1 && static_cast<std::size_t>(etag) <= mapping.edges.size());
+            TEST_CHECK(edir == 1 || edir == -1);
+            const auto* ge = mapping.edges.at(static_cast<std::size_t>(etag - 1));
+            if (ge->v_beg && ge->v_end)
+            {
+                vertex_boundary_flux[ge->v_beg] -= edir;
+                vertex_boundary_flux[ge->v_end] += edir;
+            }
+        }
+        for (const auto& vkv : vertex_boundary_flux)
+        {
+            TEST_CHECK(vkv.second == 0);
+        }
+    }
 
     // Verify each MockDiscreteRegion's oriented MockDiscreteFace shells enclose exact volume 1.0 each!
     double total_gmsh_vol = 0.0;

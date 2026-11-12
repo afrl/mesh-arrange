@@ -713,12 +713,9 @@ UpdateResult split_constrained_edges(Triangulation& t, SeamInfo& seams)
         }
     }
 
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << GlobalOptions::get().curr_status_padding
-                  << "* split_constrained_edges - Splitting " << edges_to_split.size() << " edges."
-                  << std::endl;
-    }
+    GlobalOptions::get().log_info(GlobalOptions::get().curr_status_padding +
+                                  "* split_constrained_edges - Splitting " +
+                                  std::to_string(edges_to_split.size()) + " edges.");
 
     const auto update_result = split_edges(edges_to_split, t);
 
@@ -739,12 +736,9 @@ UpdateResult split_constrained_edges(Triangulation& t, SeamInfo& seams)
 
 void split_large_edges(const double max_edge_length, Triangulation& t, SeamInfo& seams)
 {
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << GlobalOptions::get().curr_status_padding
-                  << "* split_large_edges - Splitting edges larger than " << max_edge_length
-                  << std::endl;
-    }
+    GlobalOptions::get().log_info(GlobalOptions::get().curr_status_padding +
+                                  "* split_large_edges - Splitting edges larger than " +
+                                  std::to_string(max_edge_length));
     while (true)
     {
         std::vector<Index> edges_to_split;

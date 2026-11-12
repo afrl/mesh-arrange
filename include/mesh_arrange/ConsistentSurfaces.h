@@ -12,8 +12,7 @@ struct ConsistentSurfaces
 {
     Triangulation consistent_surface_mesh;
     /// Maps each consistent facet ID to the 1-or-more original facet IDs that coincided there.
-    /// Note: field name preserves historical spelling for compmesh compatibility.
-    std::vector<std::vector<FacetID>> constistent_facet_to_inconsistent_facets_map;
+    std::vector<std::vector<FacetID>> consistent_facet_to_inconsistent_facets_map;
 };
 
 /// @brief Resolves all pairwise and self-intersections with exact predicates (`CGAL::Epeck`)

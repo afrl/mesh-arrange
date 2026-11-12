@@ -4,7 +4,6 @@
 #include "detail/DebugVTK.h"
 #include "detail/ElementTables.h"
 #include "detail/MathHelpers.h"
-#include "igl/winding_number.h"
 #include "mesh_arrange/GlobalOptions.h"
 #include "mesh_arrange/Optimize.h"
 #include "mesh_arrange/SplitEdges.h"
@@ -14,10 +13,10 @@
 #include <cassert>
 #include <cmath>
 #include <deque>
-#include <iostream>
 #include <limits>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -59,15 +58,6 @@ std::vector<detail::DynamicBitset> calculate_in_out_bitsets(
   const std::vector<std::vector<Index>>& object_to_surface_elements_map,
   const Eigen::MatrixXd& points)
 {
-    Eigen::MatrixX3d vertices(static_cast<Eigen::Index>(predicate_surface_mesh.vertices.size()), 3);
-    for (Eigen::Index i = 0; i < vertices.rows(); ++i)
-    {
-        for (int j = 0; j < 3; ++j)
-        {
-            vertices(i, j) = predicate_surface_mesh.vertices[static_cast<std::size_t>(i)][j];
-        }
-    }
-
     std::vector<detail::DynamicBitset> in_out_bitsets(
       static_cast<std::size_t>(points.rows()),
       detail::DynamicBitset(object_to_surface_elements_map.size()));
@@ -77,7 +67,10 @@ std::vector<detail::DynamicBitset> calculate_in_out_bitsets(
         return in_out_bitsets;
     }
 
-    Eigen::VectorXd winding_numbers(points.rows());
+    constexpr double kTwoPi = 6.283185307179586476925;
+    const auto& verts       = predicate_surface_mesh.vertices;
+    const auto& tris        = predicate_surface_mesh.triangles;
+
     for (std::size_t object_id = 0; object_id < object_to_surface_elements_map.size(); ++object_id)
     {
         const auto& elems = object_to_surface_elements_map[object_id];
@@ -86,20 +79,55 @@ std::vector<detail::DynamicBitset> calculate_in_out_bitsets(
             continue;
         }
 
-        Eigen::MatrixX3i triangles(static_cast<Eigen::Index>(elems.size()), 3);
-        for (Eigen::Index i = 0; i < triangles.rows(); ++i)
+        // Compute tight AABB of this closed object surface for fast exterior rejection
+        Eigen::Vector3d bmin = Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+        Eigen::Vector3d bmax = Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
+        for (const Index tri_id : elems)
         {
-            const Index tri_id = elems[static_cast<std::size_t>(i)];
-            for (int j = 0; j < 3; ++j)
+            for (int c = 0; c < 3; ++c)
             {
-                triangles(i, j) = static_cast<int>(predicate_surface_mesh.triangles[tri_id][j]);
+                const auto& pv = verts[tris[tri_id][c]];
+                for (int d = 0; d < 3; ++d)
+                {
+                    bmin[d] = std::min(bmin[d], pv[d]);
+                    bmax[d] = std::max(bmax[d], pv[d]);
+                }
             }
         }
+        const double pad = 1e-12 * (1.0 + (bmax - bmin).norm());
+        bmin.array() -= pad;
+        bmax.array() += pad;
 
-        igl::winding_number(vertices, triangles, points, winding_numbers);
         for (Eigen::Index i = 0; i < points.rows(); ++i)
         {
-            if (std::abs(winding_numbers(i)) > 0.5)
+            const Eigen::Vector3d q = points.row(i).transpose();
+            if (q[0] < bmin[0] || q[0] > bmax[0] || q[1] < bmin[1] || q[1] > bmax[1] ||
+                q[2] < bmin[2] || q[2] > bmax[2])
+            {
+                continue;
+            }
+
+            // Exact Van Oosterom-Strackee solid-angle winding number
+            double wn = 0.0;
+            for (const Index tri_id : elems)
+            {
+                const auto& conn        = tris[tri_id];
+                const Eigen::Vector3d a = detail::point_as_vector(verts[conn[0]]) - q;
+                const Eigen::Vector3d b = detail::point_as_vector(verts[conn[1]]) - q;
+                const Eigen::Vector3d d = detail::point_as_vector(verts[conn[2]]) - q;
+                const double la         = a.norm();
+                const double lb         = b.norm();
+                const double ld         = d.norm();
+                if (la == 0.0 || lb == 0.0 || ld == 0.0)
+                {
+                    continue;
+                }
+                const double det = a.dot(b.cross(d));
+                const double den = la * lb * ld + a.dot(b) * ld + b.dot(d) * la + d.dot(a) * lb;
+                wn += std::atan2(det, den) / kTwoPi;
+            }
+
+            if (std::abs(wn) > 0.5)
             {
                 in_out_bitsets[static_cast<std::size_t>(i)].set(object_id, true);
             }
@@ -213,11 +241,8 @@ std::pair<SegmentRegionsResult, Eigen::MatrixXd> tetrahedralize_and_segment(
   const Triangulation& consistent_surface_mesh_to_segment,
   const PlcTetrahedralizerFn& plc_tetrahedralizer)
 {
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << GlobalOptions::get().curr_status_padding
-                  << " - Tetrahedralizing surface for region segmentation" << std::endl;
-    }
+    GlobalOptions::get().log_info(GlobalOptions::get().curr_status_padding +
+                                  " - Tetrahedralizing surface for region segmentation");
 
     const PlcTetrahedralizerFn& backend =
       plc_tetrahedralizer ? plc_tetrahedralizer : PlcTetrahedralizerFn(default_plc_tetrahedralizer);
@@ -914,7 +939,7 @@ ObjectRegionBoundaryInfo find_object_and_region_boundary_info(
               region_boundary_id_to_consistent_facet_map[boundary_id];
 
             if (consistent_facet_id >=
-                consistent_surfaces.constistent_facet_to_inconsistent_facets_map.size())
+                consistent_surfaces.consistent_facet_to_inconsistent_facets_map.size())
             {
                 continue;
             }
@@ -922,7 +947,7 @@ ObjectRegionBoundaryInfo find_object_and_region_boundary_info(
             bool boundary_is_along_object = false;
             for (const FacetID predicate_facet_id :
                  consistent_surfaces
-                   .constistent_facet_to_inconsistent_facets_map[consistent_facet_id])
+                   .consistent_facet_to_inconsistent_facets_map[consistent_facet_id])
             {
                 for (const FacetID f : inconsistent_combined_surfaces.object_to_facets_map[object_id])
                 {
@@ -965,10 +990,7 @@ std::pair<bool, SegmentRegionsResult> attempt_optimize_then_segment_regions(
 {
     try
     {
-        if (GlobalOptions::get().verbose)
-        {
-            std::cout << " - Attempting to optimize surface before segmenting regions" << std::endl;
-        }
+        GlobalOptions::get().log_info(" - Attempting to optimize surface before segmenting regions");
         GlobalOptions::get().curr_status_padding = "   ";
 
         auto consistent_surface_copy = consistent_surfaces;
@@ -985,19 +1007,13 @@ std::pair<bool, SegmentRegionsResult> attempt_optimize_then_segment_regions(
         std::swap(consistent_surfaces, consistent_surface_copy);
         GlobalOptions::get().curr_status_padding = "";
 
-        if (GlobalOptions::get().verbose)
-        {
-            std::cout << " - Optimization strategy succeeded" << std::endl;
-        }
+        GlobalOptions::get().log_info(" - Optimization strategy succeeded");
         return { true, std::move(seg_region_result) };
     }
     catch (...)
     {
         GlobalOptions::get().curr_status_padding = "";
-        if (GlobalOptions::get().verbose)
-        {
-            std::cout << " - Optimization strategy failed" << std::endl;
-        }
+        GlobalOptions::get().log_info(" - Optimization strategy failed");
         return { false, SegmentRegionsResult{} };
     }
 }
@@ -1353,19 +1369,15 @@ SegmentedTetrahedralization identify_features(
   ConsistentSurfaces& consistent_surfaces,
   const PlcTetrahedralizerFn& plc_tetrahedralizer)
 {
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << "* identify_features - Starting feature segmentation" << std::endl;
-    }
+    GlobalOptions::get().log_info("* identify_features - Starting feature segmentation");
 
     const auto stats = query_edge_length_stats(consistent_surfaces.consistent_surface_mesh);
-    if (GlobalOptions::get().verbose)
+    if (GlobalOptions::get().verbose || GlobalOptions::get().log_callback)
     {
-        std::cout << " - Edge length statistics:" << std::endl;
-        std::cout << "     min: " << stats.min << std::endl;
-        std::cout << "     max: " << stats.max << std::endl;
-        std::cout << "     mean: " << stats.mean << std::endl;
-        std::cout << "     std. dev.: " << stats.std_dev << std::endl;
+        std::ostringstream oss;
+        oss << " - Edge length statistics: min=" << stats.min << ", max=" << stats.max
+            << ", mean=" << stats.mean << ", std_dev=" << stats.std_dev;
+        GlobalOptions::get().log_info(oss.str());
     }
 
     SegmentRegionsResult seg_region_result;
@@ -1376,10 +1388,7 @@ SegmentedTetrahedralization identify_features(
                                                             plc_tetrahedralizer);
         if (!result.first)
         {
-            if (GlobalOptions::get().verbose)
-            {
-                std::cout << " - Segmenting consistent surface without modification" << std::endl;
-            }
+            GlobalOptions::get().log_info(" - Segmenting consistent surface without modification");
             seg_region_result =
               segment_regions(inconsistent_combined_surfaces, consistent_surfaces, plc_tetrahedralizer);
         }
@@ -1390,18 +1399,12 @@ SegmentedTetrahedralization identify_features(
     }
     else
     {
-        if (GlobalOptions::get().verbose)
-        {
-            std::cout << " - Segmenting consistent surface without modification" << std::endl;
-        }
+        GlobalOptions::get().log_info(" - Segmenting consistent surface without modification");
         seg_region_result =
           segment_regions(inconsistent_combined_surfaces, consistent_surfaces, plc_tetrahedralizer);
     }
 
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << " - Segmenting region boundaries" << std::endl;
-    }
+    GlobalOptions::get().log_info(" - Segmenting region boundaries");
     auto region_boundary_result = segment_region_boundaries(inconsistent_combined_surfaces,
                                                             consistent_surfaces,
                                                             seg_region_result.tetrahedralization,
@@ -1421,10 +1424,7 @@ SegmentedTetrahedralization identify_features(
                           "initial_");
     }
 
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << " - Removing unnecessary region boundaries" << std::endl;
-    }
+    GlobalOptions::get().log_info(" - Removing unnecessary region boundaries");
     remove_unneccessary_region_boundaries(inconsistent_combined_surfaces.object_priorities,
                                           seg_region_result,
                                           region_boundary_result.region_boundaries_info,
@@ -1449,10 +1449,7 @@ SegmentedTetrahedralization identify_features(
                           "final_");
     }
 
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << " - Segmenting seams" << std::endl;
-    }
+    GlobalOptions::get().log_info(" - Segmenting seams");
     auto seam_info = segment_seams(seg_region_result.tetrahedralization,
                                    region_boundary_result.region_boundaries_info);
 

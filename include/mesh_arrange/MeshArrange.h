@@ -3,6 +3,7 @@
 #include "mesh_arrange/CombinedSurfaces.h"
 #include "mesh_arrange/ConsistentSurfaces.h"
 #include "mesh_arrange/FeatureIdentification.h"
+#include "mesh_arrange/GlobalOptions.h"
 #include "mesh_arrange/InterpenetrationRemoval.h"
 #include "mesh_arrange/Optimize.h"
 #include "mesh_arrange/PlcBackend.h"
@@ -39,8 +40,12 @@ struct ArrangeOptions
     /// If > 0.0, splits surface edges longer than `max_edge_length` while preserving seams.
     double max_edge_length = 0.0;
 
-    /// Enables progress logging to stdout.
+    /// Enables progress logging (writes to `log_callback` if set, otherwise `std::cout`).
     bool verbose = false;
+
+    /// Optional message sink (e.g., forwarding to Gmsh's `Msg::Info` / `Msg::Debug`).
+    /// When set, `mesh_arrange` routes all diagnostic output through this callback instead of `std::cout`.
+    LogCallback log_callback = {};
 
     /// Runs bidirectional topological invariant checks on edges, faces, and tetrahedra.
     bool check_topology = false;
@@ -97,8 +102,12 @@ struct BRepFace
     std::vector<Index> surface_tri_ids;
     /// Pair of bounded 3D region IDs `{r0, r1}` (`r1 == NOT_SET_RegionID` on exterior boundary).
     std::pair<RegionID, RegionID> bounded_regions = { NOT_SET_RegionID, NOT_SET_RegionID };
-    /// Signed bounding curves `{curve_id, +1 or -1}` along the boundary of this face patch.
+    /// Signed bounding curves `{curve_id, +1 or -1}` along the outer/inner boundary of this face patch.
     std::vector<std::pair<Index, int>> signed_bounding_curves;
+    /// Internal / embedded seam curves (`curve_id` in `brep_curves`) whose two sides both belong to this face.
+    std::vector<Index> embedded_curves;
+    /// Isolated `BRepVertex` indices (`brep_vertices`) embedded in the interior of this face.
+    std::vector<Index> embedded_vertices;
     /// Input `object_id`s whose original boundary coincided with this patch (empty for medial sheets).
     std::vector<Index> origin_objects;
 };

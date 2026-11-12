@@ -153,11 +153,8 @@ void split_overlap_edges(SegmentedTetrahedralization& st)
         }
     }
 
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << " - Splitting " << edges_to_split_set.size() << " edges in overlap regions."
-                  << std::endl;
-    }
+    GlobalOptions::get().log_info(" - Splitting " + std::to_string(edges_to_split_set.size()) +
+                                  " edges in overlap regions.");
 
     const std::vector<Index> edges_to_split(edges_to_split_set.begin(), edges_to_split_set.end());
     split_edges(edges_to_split, st);
@@ -170,10 +167,7 @@ void split_large_edges(const double max_edge_length, SegmentedTetrahedralization
         return;
     }
 
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << "Refining via splitting edges..." << std::endl;
-    }
+    GlobalOptions::get().log_info("Refining via splitting edges...");
 
     while (true)
     {
@@ -194,10 +188,8 @@ void split_large_edges(const double max_edge_length, SegmentedTetrahedralization
             break;
         }
 
-        if (GlobalOptions::get().verbose)
-        {
-            std::cout << " - Splitting " << edges_to_split.size() << " edges." << std::endl;
-        }
+        GlobalOptions::get().log_info(" - Splitting " + std::to_string(edges_to_split.size()) +
+                                      " edges.");
         split_edges(edges_to_split, st);
     }
 }

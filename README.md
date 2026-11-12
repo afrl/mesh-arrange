@@ -96,6 +96,8 @@ ctest --test-dir build-no-tetgen --output-on-failure
 
 ---
 
-## Public Release Information
+## License & Public Release Information
+
+Licensed under the **BSD 3-Clause License** (see [`LICENSE`](LICENSE) for full terms and third-party notices for `libigl` and optional `TetGen`).
 
 Distribution Statement A. Approved for public release: distribution is unlimited. Case #: AFRL-2026-4513

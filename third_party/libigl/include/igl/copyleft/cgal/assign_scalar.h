@@ -10,8 +10,8 @@
 #define IGL_COPYLEFT_CGAL_ASSIGN_SCALAR_H
 #include "../../igl_inline.h"
 #include <CGAL/Exact_predicates_exact_constructions_kernel.h>
+#if !defined(WIN32) && !defined(CGAL_DISABLE_GMP)
 #include <CGAL/Exact_predicates_exact_constructions_kernel_with_sqrt.h>
-#ifndef WIN32
 #include <CGAL/gmpxx.h>
 #endif
 
@@ -71,6 +71,7 @@ namespace igl
       IGL_INLINE void assign_scalar(
         const float& c,
         double& d);
+#if !defined(WIN32) && !defined(CGAL_DISABLE_GMP)
       IGL_INLINE void assign_scalar(
         const CGAL::Exact_predicates_exact_constructions_kernel_with_sqrt::FT & cgal,
         CGAL::Exact_predicates_exact_constructions_kernel_with_sqrt::FT & d);
@@ -80,7 +81,6 @@ namespace igl
       IGL_INLINE void assign_scalar(
         const CGAL::Exact_predicates_exact_constructions_kernel_with_sqrt::FT & cgal,
         float& d);
-#ifndef WIN32
       IGL_INLINE void assign_scalar(
         const CGAL::Simple_cartesian<mpq_class>::FT & cgal,
         CGAL::Simple_cartesian<mpq_class>::FT & d);
@@ -90,7 +90,7 @@ namespace igl
       IGL_INLINE void assign_scalar(
         const CGAL::Simple_cartesian<mpq_class>::FT & cgal,
         float& d);
-#endif // WIN32
+#endif // !WIN32 && !CGAL_DISABLE_GMP
     }
   }
 }

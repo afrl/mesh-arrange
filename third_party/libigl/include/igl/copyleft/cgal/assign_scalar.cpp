@@ -117,6 +117,7 @@ IGL_INLINE void igl::copyleft::cgal::assign_scalar(
   d = c;
 }
 
+#if !defined(WIN32) && !defined(CGAL_DISABLE_GMP)
 IGL_INLINE void igl::copyleft::cgal::assign_scalar(
   const CGAL::Exact_predicates_exact_constructions_kernel_with_sqrt::FT & cgal,
   CGAL::Exact_predicates_exact_constructions_kernel_with_sqrt::FT & d)
@@ -149,8 +150,6 @@ IGL_INLINE void igl::copyleft::cgal::assign_scalar(
       d = next;
   } while (d < float(interval.second));
 }
-
-#ifndef WIN32
 
 IGL_INLINE void igl::copyleft::cgal::assign_scalar(
   const CGAL::Simple_cartesian<mpq_class>::FT & cgal,
@@ -185,7 +184,7 @@ IGL_INLINE void igl::copyleft::cgal::assign_scalar(
   } while (d < float(interval.second));
 }
 
-#endif // WIN32
+#endif // !WIN32 && !CGAL_DISABLE_GMP
 
 #ifdef IGL_STATIC_LIBRARY
 // Explicit template instantiation

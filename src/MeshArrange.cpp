@@ -25,6 +25,7 @@ struct ScopedGlobalOptions
     {
         auto& g                     = GlobalOptions::get();
         g.verbose                   = opts.verbose;
+        g.log_callback              = opts.log_callback;
         g.check_common_errors       = opts.check_topology;
         g.write_intermediate_meshes = opts.write_debug_vtk;
         g.output_dir                = opts.debug_output_dir;
@@ -352,20 +353,31 @@ void build_brep_topology(const SegmentedTetrahedralization& st, ArrangeResult& r
         }
     }
 
-    // Compute signed bounding curves for each BRepFace from boundary half-edges
+    // Compute signed bounding curves and embedded curves/vertices for each BRepFace
     for (RegionBoundaryID bid = 0; bid < n_faces; ++bid)
     {
         auto& bf = res.brep_faces[bid];
         std::set<std::pair<Index, int>> signed_curves_set;
+        std::set<Index> bound_curve_ids;
+        std::set<Index> embedded_curves_set;
+        std::set<Index> face_global_verts;
 
         for (std::size_t local_ti = 0; local_ti < bf.triangles.size(); ++local_ti)
         {
             const Index tid  = bf.surface_tri_ids[local_ti];
             const auto& conn = bf.triangles[local_ti];
+            face_global_verts.insert(conn[0]);
+            face_global_verts.insert(conn[1]);
+            face_global_verts.insert(conn[2]);
 
             for (int le = 0; le < 3; ++le)
             {
                 const Index eid = surf.tri_to_edges_map[tid][le];
+                const auto it_c = edge_to_curve_dir.find(eid);
+                if (it_c == edge_to_curve_dir.end())
+                {
+                    continue;
+                }
 
                 int same_face_deg = 0;
                 for (const auto& tp : surf.edge_to_tris_map[eid])
@@ -375,27 +387,66 @@ void build_brep_topology(const SegmentedTetrahedralization& st, ArrangeResult& r
                         ++same_face_deg;
                     }
                 }
-                if (same_face_deg != 1)
+                if (same_face_deg == 1)
                 {
-                    continue;
+                    const Index hu      = conn[le];
+                    const Index hv      = conn[(le + 1) % 3];
+                    const auto& ed      = surf.edges[eid];
+                    const int he_sign   = (hu == ed[0] && hv == ed[1]) ? +1 : -1;
+                    const int curve_dir = he_sign * it_c->second.second;
+                    signed_curves_set.emplace(it_c->second.first, curve_dir);
+                    bound_curve_ids.insert(it_c->second.first);
                 }
-
-                const auto it_c = edge_to_curve_dir.find(eid);
-                if (it_c == edge_to_curve_dir.end())
+                else if (same_face_deg >= 2)
                 {
-                    continue;
+                    embedded_curves_set.insert(it_c->second.first);
                 }
-
-                const Index hu      = conn[le];
-                const Index hv      = conn[(le + 1) % 3];
-                const auto& ed      = surf.edges[eid];
-                const int he_sign   = (hu == ed[0] && hv == ed[1]) ? +1 : -1;
-                const int curve_dir = he_sign * it_c->second.second;
-                signed_curves_set.emplace(it_c->second.first, curve_dir);
             }
         }
 
+        for (const Index cid : bound_curve_ids)
+        {
+            embedded_curves_set.erase(cid);
+        }
+
         bf.signed_bounding_curves.assign(signed_curves_set.begin(), signed_curves_set.end());
+        bf.embedded_curves.assign(embedded_curves_set.begin(), embedded_curves_set.end());
+
+        // Identify any isolated BRepVertex lying on this face with no curve attached to this face
+        std::set<Index> curve_endpoint_bvs;
+        for (const Index cid : bound_curve_ids)
+        {
+            const auto& bc = res.brep_curves[cid];
+            if (bc.start_brep_vertex != NOT_SET_Index)
+            {
+                curve_endpoint_bvs.insert(bc.start_brep_vertex);
+            }
+            if (bc.end_brep_vertex != NOT_SET_Index)
+            {
+                curve_endpoint_bvs.insert(bc.end_brep_vertex);
+            }
+        }
+        for (const Index cid : embedded_curves_set)
+        {
+            const auto& bc = res.brep_curves[cid];
+            if (bc.start_brep_vertex != NOT_SET_Index)
+            {
+                curve_endpoint_bvs.insert(bc.start_brep_vertex);
+            }
+            if (bc.end_brep_vertex != NOT_SET_Index)
+            {
+                curve_endpoint_bvs.insert(bc.end_brep_vertex);
+            }
+        }
+        for (std::size_t bvi = 0; bvi < res.brep_vertices.size(); ++bvi)
+        {
+            const Index idx = static_cast<Index>(bvi);
+            if (face_global_verts.count(res.brep_vertices[bvi].global_vertex_id) > 0 &&
+                curve_endpoint_bvs.count(idx) == 0)
+            {
+                bf.embedded_vertices.push_back(idx);
+            }
+        }
     }
 
     // -------------------------------------------------------------------------

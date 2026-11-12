@@ -3,11 +3,42 @@
 #include "mesh_arrange/MeshArrange.h"
 
 #include <list>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace mesh_arrange
 {
+
+namespace gmsh_detail
+{
+
+template<typename FaceT, typename EdgeT>
+auto maybe_add_embedded_edge(FaceT* gf, EdgeT* ge, int)
+  -> decltype(gf->addEmbeddedEdge(ge), void())
+{
+    gf->addEmbeddedEdge(ge);
+}
+
+template<typename FaceT, typename EdgeT>
+void maybe_add_embedded_edge(FaceT*, EdgeT*, long)
+{
+}
+
+template<typename FaceT, typename VertexT>
+auto maybe_add_embedded_vertex(FaceT* gf, VertexT* gv, int)
+  -> decltype(gf->addEmbeddedVertex(gv), void())
+{
+    gf->addEmbeddedVertex(gv);
+}
+
+template<typename FaceT, typename VertexT>
+void maybe_add_embedded_vertex(FaceT*, VertexT*, long)
+{
+}
+
+} // namespace gmsh_detail
 
 /// @brief Header-only adapter that populates a Gmsh `GModel` (or API-compatible discrete B-Rep model)
 ///        from an `ArrangeResult` using Gmsh's native discrete entity classes:
@@ -89,7 +120,7 @@ populate_gmsh_discrete_model(GModelT* model,
         auto* mv       = new MVertexT(bv.point[0], bv.point[1], bv.point[2], gv);
         gv->mesh_vertices.push_back(mv);
         model->add(gv);
-        mapping.vertices[i]                      = gv;
+        mapping.vertices[i]                        = gv;
         global_vid_to_mvertex[bv.global_vertex_id] = mv;
     }
 
@@ -113,8 +144,8 @@ populate_gmsh_discrete_model(GModelT* model,
                 auto it         = global_vid_to_mvertex.find(vid);
                 if (it == global_vid_to_mvertex.end())
                 {
-                    const auto& p  = coords[vid];
-                    auto* mv       = new MVertexT(p[0], p[1], p[2], ge);
+                    const auto& p = coords[vid];
+                    auto* mv      = new MVertexT(p[0], p[1], p[2], ge);
                     ge->mesh_vertices.push_back(mv);
                     global_vid_to_mvertex.emplace(vid, mv);
                 }
@@ -138,19 +169,41 @@ populate_gmsh_discrete_model(GModelT* model,
         auto* gf       = new DiscreteFaceT(model, base_face_tag + static_cast<int>(i));
 
         std::vector<int> edge_tags;
+        std::vector<int> edge_dirs;
         edge_tags.reserve(bf.signed_bounding_curves.size());
-        for (const auto& [cid, dir] : bf.signed_bounding_curves)
+        edge_dirs.reserve(bf.signed_bounding_curves.size());
+        for (std::size_t k = 0; k < bf.signed_bounding_curves.size(); ++k)
         {
-            const int tag = base_edge_tag + static_cast<int>(cid);
-            edge_tags.push_back(dir >= 0 ? tag : -tag);
+            const Index cid = bf.signed_bounding_curves[k].first;
+            const int dir   = bf.signed_bounding_curves[k].second;
+            edge_tags.push_back(base_edge_tag + static_cast<int>(cid));
+            edge_dirs.push_back(dir >= 0 ? 1 : -1);
         }
         if (!edge_tags.empty())
         {
-            gf->setBoundEdges(edge_tags);
+            gf->setBoundEdges(edge_tags, edge_dirs);
         }
 
-        for (const auto& tri : bf.triangles)
+        for (std::size_t k = 0; k < bf.embedded_curves.size(); ++k)
         {
+            const Index cid = bf.embedded_curves[k];
+            if (cid < mapping.edges.size() && mapping.edges[cid] != nullptr)
+            {
+                gmsh_detail::maybe_add_embedded_edge(gf, mapping.edges[cid], 0);
+            }
+        }
+        for (std::size_t k = 0; k < bf.embedded_vertices.size(); ++k)
+        {
+            const Index vid = bf.embedded_vertices[k];
+            if (vid < mapping.vertices.size() && mapping.vertices[vid] != nullptr)
+            {
+                gmsh_detail::maybe_add_embedded_vertex(gf, mapping.vertices[vid], 0);
+            }
+        }
+
+        for (std::size_t t_idx = 0; t_idx < bf.triangles.size(); ++t_idx)
+        {
+            const auto& tri  = bf.triangles[t_idx];
             MVertexT* mvs[3] = { nullptr, nullptr, nullptr };
             for (int c = 0; c < 3; ++c)
             {
@@ -183,10 +236,12 @@ populate_gmsh_discrete_model(GModelT* model,
         std::vector<int> face_dirs;
         face_tags.reserve(bvol.signed_bounding_faces.size());
         face_dirs.reserve(bvol.signed_bounding_faces.size());
-        for (const auto& [fid, dir] : bvol.signed_bounding_faces)
+        for (std::size_t k = 0; k < bvol.signed_bounding_faces.size(); ++k)
         {
+            const RegionBoundaryID fid = bvol.signed_bounding_faces[k].first;
+            const int dir              = bvol.signed_bounding_faces[k].second;
             face_tags.push_back(base_face_tag + static_cast<int>(fid));
-            face_dirs.push_back(dir);
+            face_dirs.push_back(dir >= 0 ? 1 : -1);
         }
         if (!face_tags.empty())
         {

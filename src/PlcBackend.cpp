@@ -71,8 +71,9 @@ PlcTetOutput default_plc_tetrahedralizer(const Triangulation& plc_surface)
     flags.nobisect       = 1;
     flags.nomergefacet   = 1;
     flags.nomergevertex  = 1;
-    flags.quiet          = GlobalOptions::get().verbose ? 0 : 1;
-    flags.verbose        = GlobalOptions::get().verbose ? 1 : 0;
+    const bool direct_stdout = GlobalOptions::get().verbose && !GlobalOptions::get().log_callback;
+    flags.quiet              = direct_stdout ? 0 : 1;
+    flags.verbose            = direct_stdout ? 1 : 0;
     flags.quality        = 0;
     flags.smooth_maxiter = 0;
     flags.noimprove      = 1;

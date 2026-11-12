@@ -4,18 +4,50 @@
 #include "mesh_arrange/Triangulation.h"
 
 #include <Eigen/Dense>
-#include "igl/AABB.h"
 
 #include <vector>
 
 namespace mesh_arrange::detail
 {
 
+/// @brief Compact static 3D triangle AABB bounding-volume hierarchy for closest-point queries.
+class TriangleAABB
+{
+  public:
+    struct Node
+    {
+        Eigen::Vector3d bmin = Eigen::Vector3d::Zero();
+        Eigen::Vector3d bmax = Eigen::Vector3d::Zero();
+        int left             = -1;
+        int right            = -1;
+        int start            = 0;
+        int count            = 0;
+    };
+
+    void init(const Eigen::MatrixX3d& V, const Eigen::MatrixX3i& F);
+
+    Eigen::Vector3d closest_point(const Eigen::MatrixX3d& V,
+                                  const Eigen::MatrixX3i& F,
+                                  const Eigen::Vector3d& p) const;
+
+    bool empty() const noexcept { return nodes_.empty(); }
+
+  private:
+    std::vector<int> tri_order_;
+    std::vector<Node> nodes_;
+
+    int build_recursive(const Eigen::MatrixX3d& V,
+                        const Eigen::MatrixX3i& F,
+                        const std::vector<Eigen::Vector3d>& centroids,
+                        int start,
+                        int count);
+};
+
 struct IGLTriSurf
 {
     Eigen::MatrixX3d vertices;
     Eigen::MatrixX3i triangles;
-    igl::AABB<Eigen::MatrixX3d, 3> tree;
+    TriangleAABB tree;
 };
 
 struct IGLToTriangulationResult

@@ -258,12 +258,9 @@ void optimize_tangential_smoothing(Triangulation& t,
         return;
     }
 
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << GlobalOptions::get().curr_status_padding
-                  << "* optimize_tangential_smoothing - Starting iterative optimization"
-                  << std::endl;
-    }
+    GlobalOptions::get().log_info(
+      GlobalOptions::get().curr_status_padding +
+      "* optimize_tangential_smoothing - Starting iterative optimization");
 
     if (GlobalOptions::get().write_debug_meshes)
     {

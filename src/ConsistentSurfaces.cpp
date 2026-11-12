@@ -4,12 +4,10 @@
 #include "detail/IGLHelpers.h"
 #include "detail/MathHelpers.h"
 #include "igl/copyleft/cgal/remesh_self_intersections.h"
-#include "igl/remove_unreferenced.h"
 #include "mesh_arrange/GlobalOptions.h"
 
 #include <algorithm>
 #include <cassert>
-#include <iostream>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -43,10 +41,7 @@ std::vector<Index> find_facet_to_object_map(
 
 ConsistentSurfaces create_consistent_surface(const CombinedSurfaces& combined_inconsistent_surfaces)
 {
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << "* Creating consistent surface by remeshing intersections" << std::endl;
-    }
+    GlobalOptions::get().log_info("* Creating consistent surface by remeshing intersections");
 
     const auto& inconsistent_surface = combined_inconsistent_surfaces.inconsistent_surface_mesh;
     if (inconsistent_surface.triangles.empty())
@@ -97,10 +92,7 @@ ConsistentSurfaces create_consistent_surface(const CombinedSurfaces& combined_in
         }
     }
 
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << " - Remeshing self intersections" << std::endl;
-    }
+    GlobalOptions::get().log_info(" - Remeshing self intersections");
 
     igl::copyleft::cgal::remesh_self_intersections(vertices,
                                                    triangles,
@@ -116,14 +108,42 @@ ConsistentSurfaces create_consistent_surface(const CombinedSurfaces& combined_in
                   new_triangles.data() + new_triangles.size(),
                   [&unique_vertex_map](auto& a) { a = unique_vertex_map(a); });
 
-    // Remove any vertices now unreferenced after duplicate mapping
-    Eigen::VectorXi removed_vertex_map;
-    igl::remove_unreferenced(new_vertices, new_triangles, vertices, triangles, removed_vertex_map);
-
-    if (GlobalOptions::get().verbose)
+    // Compact referenced vertices in ascending index order
+    std::vector<int> old_to_new(static_cast<std::size_t>(new_vertices.rows()), -1);
+    for (Eigen::Index f = 0; f < new_triangles.rows(); ++f)
     {
-        std::cout << " - Updating data structures" << std::endl;
+        for (int c = 0; c < 3; ++c)
+        {
+            old_to_new[static_cast<std::size_t>(new_triangles(f, c))] = 0;
+        }
     }
+    int n_used = 0;
+    for (Eigen::Index v = 0; v < new_vertices.rows(); ++v)
+    {
+        if (old_to_new[static_cast<std::size_t>(v)] == 0)
+        {
+            old_to_new[static_cast<std::size_t>(v)] = n_used++;
+        }
+    }
+    vertices.resize(n_used, 3);
+    for (Eigen::Index v = 0; v < new_vertices.rows(); ++v)
+    {
+        const int nv = old_to_new[static_cast<std::size_t>(v)];
+        if (nv >= 0)
+        {
+            vertices.row(nv) = new_vertices.row(v);
+        }
+    }
+    triangles.resize(new_triangles.rows(), 3);
+    for (Eigen::Index f = 0; f < new_triangles.rows(); ++f)
+    {
+        for (int c = 0; c < 3; ++c)
+        {
+            triangles(f, c) = old_to_new[static_cast<std::size_t>(new_triangles(f, c))];
+        }
+    }
+
+    GlobalOptions::get().log_info(" - Updating data structures");
 
     auto r                           = detail::igl_to_triangulation(vertices, triangles);
     auto& consistent_surface_mesh    = r.t;

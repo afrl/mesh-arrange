@@ -3,7 +3,6 @@
 #include "detail/DebugVTK.h"
 #include "detail/ElementTables.h"
 #include "detail/MathHelpers.h"
-#include "igl/cotmatrix.h"
 #include "mesh_arrange/GlobalOptions.h"
 #include "mesh_arrange/Refinement.h"
 
@@ -15,7 +14,6 @@
 #include <cassert>
 #include <cmath>
 #include <deque>
-#include <iostream>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -350,9 +348,6 @@ GroupHarmonicField compute_group_harmonic_field(const SegmentedTetrahedralizatio
         }
     }
 
-    Eigen::SparseMatrix<double> L_cot;
-    igl::cotmatrix(V_ov, T_ov, L_cot);
-
     struct PairHash
     {
         std::size_t operator()(const std::pair<int, int>& p) const noexcept
@@ -366,36 +361,67 @@ GroupHarmonicField compute_group_harmonic_field(const SegmentedTetrahedralizatio
 
     for (int t = 0; t < n_tets; ++t)
     {
+        int vid[4] = { T_ov(t, 0), T_ov(t, 1), T_ov(t, 2), T_ov(t, 3) };
         for (int e = 0; e < 6; ++e)
         {
-            int u = T_ov(t, detail::kTetEdges[e][0]);
-            int v = T_ov(t, detail::kTetEdges[e][1]);
+            int u = vid[detail::kTetEdges[e][0]];
+            int v = vid[detail::kTetEdges[e][1]];
             if (u > v)
             {
                 std::swap(u, v);
             }
             edge_cot_weight.emplace(std::make_pair(u, v), 0.0);
         }
+
+        Eigen::Vector3d q[4] = { V_ov.row(vid[0]).transpose(),
+                                 V_ov.row(vid[1]).transpose(),
+                                 V_ov.row(vid[2]).transpose(),
+                                 V_ov.row(vid[3]).transpose() };
+        double six_v         = (q[1] - q[0]).dot((q[2] - q[0]).cross(q[3] - q[0]));
+        if (six_v < 0.0)
+        {
+            std::swap(vid[1], vid[2]);
+            std::swap(q[1], q[2]);
+            six_v = -six_v;
+        }
+        if (six_v <= 0.0)
+        {
+            continue;
+        }
+
+        // Outward face double-area vectors M_a opposite vertex q[a] (||M_a|| = 2 * Area_a):
+        // -int_{tet} (grad phi_a . grad phi_b) dV = -(M_a . M_b) / (36 * V_tet) = (1/6) l_opp cot(theta_opp)
+        const Eigen::Vector3d M[4] = { (q[2] - q[1]).cross(q[3] - q[1]),
+                                       (q[3] - q[0]).cross(q[2] - q[0]),
+                                       (q[1] - q[0]).cross(q[3] - q[0]),
+                                       (q[2] - q[0]).cross(q[1] - q[0]) };
+        const double inv_36_vol    = 1.0 / (6.0 * six_v);
+
+        for (int a = 0; a < 4; ++a)
+        {
+            for (int b = a + 1; b < 4; ++b)
+            {
+                int u = vid[a];
+                int v = vid[b];
+                if (u > v)
+                {
+                    std::swap(u, v);
+                }
+                edge_cot_weight[std::make_pair(u, v)] += -M[a].dot(M[b]) * inv_36_vol;
+            }
+        }
     }
 
     std::vector<double> finite_pos_cots;
     finite_pos_cots.reserve(edge_cot_weight.size());
-    for (int outer = 0; outer < L_cot.outerSize(); ++outer)
+    for (auto& kv : edge_cot_weight)
     {
-        for (Eigen::SparseMatrix<double>::InnerIterator it(L_cot, outer); it; ++it)
+        const double val   = kv.second;
+        const double w_pos = (std::isfinite(val) && val > 0.0) ? val : 0.0;
+        kv.second          = w_pos;
+        if (w_pos > 0.0)
         {
-            const int r = static_cast<int>(it.row());
-            const int c = static_cast<int>(it.col());
-            if (r < c)
-            {
-                const double val   = it.value();
-                const double w_pos = (std::isfinite(val) && val > 0.0) ? val : 0.0;
-                edge_cot_weight[std::make_pair(r, c)] = w_pos;
-                if (w_pos > 0.0)
-                {
-                    finite_pos_cots.push_back(w_pos);
-                }
-            }
+            finite_pos_cots.push_back(w_pos);
         }
     }
 
@@ -1763,7 +1789,7 @@ void subdivide_and_partition_overlaps(const CombinedSurfaces& inconsistent_combi
     }
 
     const FacetID n_consistent_facets = static_cast<FacetID>(
-      consistent_surfaces.constistent_facet_to_inconsistent_facets_map.size());
+      consistent_surfaces.consistent_facet_to_inconsistent_facets_map.size());
     FacetID max_existing_facet = 0;
     if (!st.region_info.tri_to_facet_map.empty())
     {
@@ -1983,7 +2009,7 @@ void subdivide_and_partition_overlaps(const CombinedSurfaces& inconsistent_combi
             continue;
         }
         const auto& pred_facets =
-          consistent_surfaces.constistent_facet_to_inconsistent_facets_map[fid];
+          consistent_surfaces.consistent_facet_to_inconsistent_facets_map[fid];
         if (pred_facets.size() <= 1)
         {
             continue;
@@ -2032,19 +2058,13 @@ void remove_interpenetrations(const CombinedSurfaces& inconsistent_combined_surf
 {
     if (st.object_region_info.regions_of_overlap.empty())
     {
-        if (GlobalOptions::get().verbose)
-        {
-            std::cout << "* No interpenetrations" << std::endl;
-        }
+        GlobalOptions::get().log_info("* No interpenetrations");
         return;
     }
 
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << "* remove_interpenetrations" << std::endl;
-        std::cout << " - Initial # of overlap regions: "
-                  << st.object_region_info.regions_of_overlap.size() << std::endl;
-    }
+    GlobalOptions::get().log_info("* remove_interpenetrations");
+    GlobalOptions::get().log_info(" - Initial # of overlap regions: " +
+                                  std::to_string(st.object_region_info.regions_of_overlap.size()));
 
     split_overlap_edges(st);
 
@@ -2052,11 +2072,8 @@ void remove_interpenetrations(const CombinedSurfaces& inconsistent_combined_surf
       st.region_boundaries_info,
       st.object_region_info.regions_of_overlap);
 
-    if (GlobalOptions::get().verbose)
-    {
-        std::cout << " - Discovered " << overlap_groups.size()
-                  << " groups of contiguous overlap regions" << std::endl;
-    }
+    GlobalOptions::get().log_info(" - Discovered " + std::to_string(overlap_groups.size()) +
+                                  " groups of contiguous overlap regions");
 
     std::vector<GroupHarmonicField> group_fields;
     group_fields.reserve(overlap_groups.size());
