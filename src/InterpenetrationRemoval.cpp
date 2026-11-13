@@ -23,6 +23,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -195,15 +196,244 @@ std::array<Index, 4> make_positive_tet(const std::vector<Point3>& vertices,
     return { v0, v1, v2, v3 };
 }
 
-void refine_overlap_interiors(SegmentedTetrahedralization& st)
+struct ClosedOrientedShell
 {
-    if (st.object_region_info.regions_of_overlap.empty())
+    std::vector<Eigen::Vector3d> a;
+    std::vector<Eigen::Vector3d> b;
+    std::vector<Eigen::Vector3d> c;
+    Eigen::Vector3d bb_min = Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+    Eigen::Vector3d bb_max = Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
+
+    bool is_point_inside(const Eigen::Vector3d& p) const noexcept
     {
-        return;
+        if (a.empty())
+        {
+            return false;
+        }
+        constexpr double kPad = 1e-8;
+        if (p.x() < bb_min.x() - kPad || p.x() > bb_max.x() + kPad ||
+            p.y() < bb_min.y() - kPad || p.y() > bb_max.y() + kPad ||
+            p.z() < bb_min.z() - kPad || p.z() > bb_max.z() + kPad)
+        {
+            return false;
+        }
+
+        double omega_sum          = 0.0;
+        const std::size_t n_faces = a.size();
+        for (std::size_t i = 0; i < n_faces; ++i)
+        {
+            const Eigen::Vector3d va = a[i] - p;
+            const Eigen::Vector3d vb = b[i] - p;
+            const Eigen::Vector3d vc = c[i] - p;
+            const double la          = va.norm();
+            const double lb          = vb.norm();
+            const double lc          = vc.norm();
+            if (la <= 1e-14 || lb <= 1e-14 || lc <= 1e-14)
+            {
+                continue;
+            }
+            const double num = va.dot(vb.cross(vc));
+            const double den =
+              la * lb * lc + va.dot(vb) * lc + vb.dot(vc) * la + vc.dot(va) * lb;
+            omega_sum += 2.0 * std::atan2(num, den);
+        }
+        return std::abs(omega_sum) > (2.0 * 3.14159265358979323846);
+    }
+};
+
+struct OverlapRefinementContext
+{
+    // Keyed by sorted global vertex IDs of surviving outer boundary triangles of unified blocks:
+    // preserves exact pre-merge overlap object list on each outer triangle.
+    std::unordered_map<std::array<Index, 3>, std::vector<RegionID>, SortedTriKeyHash>
+      ext_tri_in_objects;
+    // Exact pre-merge object list at global vertices on outer shells of unified blocks.
+    std::unordered_map<Index, std::vector<RegionID>> orig_shell_vert_objects;
+    // Closed oriented shells of (Omega_block intersect S_obj) for unified overlap regions.
+    std::unordered_map<RegionID, std::shared_ptr<std::map<RegionID, ClosedOrientedShell>>>
+      region_to_obj_shells;
+};
+
+// Orients a closed degree-2 manifold triangle shell so that `out_expected_sign[i]` (+1 or -1)
+// indicates the sign of `tetrahedron_signed_volume(tri[0], tri[1], tri[2], p_inside)` for points
+// inside the bounded domain. Uses manifold half-edge propagation + volume-weighted interior tet
+// voting per connected component, so individual zero-volume coplanar boundary slivers never fail.
+template<typename InDomainTetPred>
+bool orient_closed_manifold_shell(const SegmentedTetrahedralization& st,
+                                  const std::vector<Index>& shell_tri_ids,
+                                  InDomainTetPred&& is_in_domain_tet,
+                                  std::vector<int>& out_expected_sign)
+{
+    const std::size_t n_shell = shell_tri_ids.size();
+    if (n_shell < 4)
+    {
+        return false;
     }
 
-    // Step 1: Pre-split only oversized edges on removable/internal overlap caps (and giant
-    // clipper faces cutting an overlap), never touching surviving solid outer caps or seam curves.
+    struct HalfEdgeRef
+    {
+        std::size_t tri_idx = 0;
+        int dir             = +1; // +1 if u < v along triangle cycle, -1 if u > v
+    };
+    std::map<std::pair<Index, Index>, std::vector<HalfEdgeRef>> edge_inc;
+    for (std::size_t i = 0; i < n_shell; ++i)
+    {
+        const auto& gc = st.tetrahedralization.triangles[shell_tri_ids[i]];
+        for (int e = 0; e < 3; ++e)
+        {
+            const Index u   = gc[e];
+            const Index v   = gc[(e + 1) % 3];
+            const auto key  = std::minmax(u, v);
+            const int e_dir = (u < v) ? +1 : -1;
+            edge_inc[key].push_back(HalfEdgeRef{ i, e_dir });
+        }
+    }
+
+    for (const auto& kv : edge_inc)
+    {
+        if (kv.second.size() != 2)
+        {
+            return false;
+        }
+    }
+
+    std::vector<std::array<std::pair<std::size_t, int>, 3>> tri_nbrs(n_shell);
+    std::vector<int> nbr_cnt(n_shell, 0);
+    for (const auto& kv : edge_inc)
+    {
+        const auto& r0 = kv.second[0];
+        const auto& r1 = kv.second[1];
+        // Consistent manifold orientation requires opposite half-edge traversal:
+        // rel_sign[r0] * r0.dir + rel_sign[r1] * r1.dir == 0 => rel_sign[r1] = -(r0.dir*r1.dir)*rel_sign[r0]
+        const int rel_factor = -(r0.dir * r1.dir);
+        tri_nbrs[r0.tri_idx][nbr_cnt[r0.tri_idx]++] = { r1.tri_idx, rel_factor };
+        tri_nbrs[r1.tri_idx][nbr_cnt[r1.tri_idx]++] = { r0.tri_idx, rel_factor };
+    }
+
+    out_expected_sign.assign(n_shell, 0);
+    std::vector<int> rel_sign(n_shell, 0);
+
+    for (std::size_t seed = 0; seed < n_shell; ++seed)
+    {
+        if (rel_sign[seed] != 0)
+        {
+            continue;
+        }
+        std::vector<std::size_t> comp;
+        std::deque<std::size_t> q = { seed };
+        rel_sign[seed]            = +1;
+        while (!q.empty())
+        {
+            const std::size_t cur = q.front();
+            q.pop_front();
+            comp.push_back(cur);
+            for (int k = 0; k < nbr_cnt[cur]; ++k)
+            {
+                const auto [nb, factor] = tri_nbrs[cur][k];
+                const int target_s      = rel_sign[cur] * factor;
+                if (rel_sign[nb] == 0)
+                {
+                    rel_sign[nb] = target_s;
+                    q.push_back(nb);
+                }
+                else if (rel_sign[nb] != target_s)
+                {
+                    return false;
+                }
+            }
+        }
+
+        double signed_tet_vote = 0.0;
+        double max_abs_sv      = 0.0;
+        Eigen::Vector3d c_ref  = Eigen::Vector3d::Zero();
+        for (const std::size_t idx : comp)
+        {
+            const auto& gc = st.tetrahedralization.triangles[shell_tri_ids[idx]];
+            c_ref += detail::point_as_vector(st.tetrahedralization.vertices[gc[0]]);
+        }
+        c_ref /= static_cast<double>(comp.size());
+
+        double six_div_vol = 0.0;
+        for (const std::size_t idx : comp)
+        {
+            const Index tr_id = shell_tri_ids[idx];
+            const auto& gc    = st.tetrahedralization.triangles[tr_id];
+            const Eigen::Vector3d a =
+              detail::point_as_vector(st.tetrahedralization.vertices[gc[0]]) - c_ref;
+            const Eigen::Vector3d b =
+              detail::point_as_vector(st.tetrahedralization.vertices[gc[1]]) - c_ref;
+            const Eigen::Vector3d c =
+              detail::point_as_vector(st.tetrahedralization.vertices[gc[2]]) - c_ref;
+            six_div_vol += static_cast<double>(rel_sign[idx]) * a.dot(b.cross(c));
+
+            const auto& tt = st.tetrahedralization.tri_to_tet_map[tr_id];
+            for (int side = 0; side < 2; ++side)
+            {
+                const Index tid = tt[side];
+                if (tid == NOT_SET_Index || !is_in_domain_tet(tid))
+                {
+                    continue;
+                }
+                Index v_opp = NOT_SET_Index;
+                for (const Index cv : st.tetrahedralization.tetrahedra[tid])
+                {
+                    if (cv != gc[0] && cv != gc[1] && cv != gc[2])
+                    {
+                        v_opp = cv;
+                        break;
+                    }
+                }
+                if (v_opp == NOT_SET_Index)
+                {
+                    continue;
+                }
+                const double sv =
+                  detail::tetrahedron_signed_volume(st.tetrahedralization.vertices[gc[0]],
+                                                    st.tetrahedralization.vertices[gc[1]],
+                                                    st.tetrahedralization.vertices[gc[2]],
+                                                    st.tetrahedralization.vertices[v_opp]);
+                if (std::abs(sv) > 1e-22)
+                {
+                    signed_tet_vote += static_cast<double>(rel_sign[idx]) * sv;
+                    max_abs_sv = std::max(max_abs_sv, std::abs(sv));
+                }
+            }
+        }
+
+        int comp_flip = 0;
+        if (max_abs_sv > 1e-22 && std::abs(signed_tet_vote) > 1e-22)
+        {
+            comp_flip = (signed_tet_vote > 0.0) ? +1 : -1;
+        }
+        else if (std::abs(six_div_vol) > 1e-20)
+        {
+            // Divergence volume > 0 means outward normal (b-a)x(c-a), so inward sv < 0.
+            comp_flip = (six_div_vol < 0.0) ? +1 : -1;
+        }
+        else
+        {
+            return false;
+        }
+
+        for (const std::size_t idx : comp)
+        {
+            out_expected_sign[idx] = comp_flip * rel_sign[idx];
+        }
+    }
+
+    return true;
+}
+
+OverlapRefinementContext refine_overlap_interiors(SegmentedTetrahedralization& st)
+{
+    OverlapRefinementContext ctx;
+    if (st.object_region_info.regions_of_overlap.empty())
+    {
+        return ctx;
+    }
+
+    // Step 1: Pre-split only oversized edges on removable/internal overlap caps, never touching
+    // surviving solid multi-owner caps or seam curves.
     for (int pass = 0; pass < 3; ++pass)
     {
         const auto groups = find_overlap_region_groups(st.region_boundaries_info,
@@ -376,32 +606,173 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
             Eigen::Vector3d bb_max;
         };
 
-        struct RegionReplacement
+        struct BlockReplacement
         {
-            RegionID region_id = 0;
+            std::vector<RegionID> block_rids;
+            std::vector<Index> deleted_internal_tris;
             std::vector<Point3> new_interior_pts;
             std::vector<std::array<Index, 4>> new_tets_encoded;
+            std::vector<RegionID> new_tet_regions;
         };
 
-        std::vector<RegionReplacement> replacements;
-        replacements.reserve(st.object_region_info.regions_of_overlap.size());
+        std::vector<BlockReplacement> replacements;
 
-        for (const RegionID rid : st.object_region_info.regions_of_overlap)
+        auto run_tetgen_on_block = [&](const std::vector<RegionID>& block_rids) -> bool
         {
-            const auto& region_tets = st.region_info.region_to_tets_map[rid];
-            if (region_tets.empty())
+            if (block_rids.empty())
             {
-                continue;
+                return false;
+            }
+            const std::unordered_set<RegionID> block_set(block_rids.begin(), block_rids.end());
+
+            std::vector<Index> block_tets;
+            for (const RegionID rid : block_rids)
+            {
+                const auto& rt = st.region_info.region_to_tets_map[rid];
+                block_tets.insert(block_tets.end(), rt.begin(), rt.end());
+            }
+            if (block_tets.empty())
+            {
+                return false;
             }
 
-            std::vector<Index> shell_tri_ids =
-              st.region_info.region_to_bounding_triangles_map[rid];
-            std::sort(shell_tri_ids.begin(), shell_tri_ids.end());
-            shell_tri_ids.erase(std::unique(shell_tri_ids.begin(), shell_tri_ids.end()),
-                                shell_tri_ids.end());
+            std::set<Index> candidate_tri_set;
+            for (const RegionID rid : block_rids)
+            {
+                for (const Index tr_id : st.region_info.region_to_bounding_triangles_map[rid])
+                {
+                    candidate_tri_set.insert(tr_id);
+                }
+            }
+
+            std::vector<Index> shell_tri_ids;
+            std::vector<Index> internal_tri_ids;
+            for (const Index tr_id : candidate_tri_set)
+            {
+                const auto& br    = st.region_info.tri_to_bounded_regions_map[tr_id];
+                const bool in_fst = (br.first != NOT_SET_RegionID && block_set.count(br.first) > 0);
+                const bool in_snd =
+                  (br.second != NOT_SET_RegionID && block_set.count(br.second) > 0);
+                if (in_fst && in_snd)
+                {
+                    internal_tri_ids.push_back(tr_id);
+                }
+                else if (in_fst != in_snd)
+                {
+                    shell_tri_ids.push_back(tr_id);
+                }
+            }
             if (shell_tri_ids.size() < 4)
             {
-                continue;
+                return false;
+            }
+
+            std::vector<int> expected_signs;
+            if (!orient_closed_manifold_shell(
+                  st,
+                  shell_tri_ids,
+                  [&](Index tid)
+                  { return block_set.count(st.region_info.tet_to_region_map[tid]) > 0; },
+                  expected_signs))
+            {
+                return false;
+            }
+
+            // If unifying >= 2 subregions, build exact closed oriented shells for each object first
+            std::shared_ptr<std::map<RegionID, ClosedOrientedShell>> obj_shells;
+            std::map<std::vector<RegionID>, RegionID> mask_to_rid;
+            std::vector<std::pair<Eigen::Vector3d, RegionID>> orig_tet_centroids;
+
+            if (block_rids.size() >= 2)
+            {
+                obj_shells = std::make_shared<std::map<RegionID, ClosedOrientedShell>>();
+                std::set<RegionID> block_objs;
+                for (const RegionID rid : block_rids)
+                {
+                    std::vector<RegionID> objs = st.object_region_info.region_to_objects_map[rid];
+                    std::sort(objs.begin(), objs.end());
+                    mask_to_rid.emplace(objs, rid);
+                    block_objs.insert(objs.begin(), objs.end());
+
+                    for (const Index tid : st.region_info.region_to_tets_map[rid])
+                    {
+                        const auto& tc = st.tetrahedralization.tetrahedra[tid];
+                        orig_tet_centroids.emplace_back(
+                          0.25 * (detail::point_as_vector(st.tetrahedralization.vertices[tc[0]]) +
+                                  detail::point_as_vector(st.tetrahedralization.vertices[tc[1]]) +
+                                  detail::point_as_vector(st.tetrahedralization.vertices[tc[2]]) +
+                                  detail::point_as_vector(st.tetrahedralization.vertices[tc[3]])),
+                          rid);
+                    }
+                }
+
+                for (const RegionID oid : block_objs)
+                {
+                    std::unordered_set<RegionID> obj_rset;
+                    for (const RegionID rid : block_rids)
+                    {
+                        const auto& ro = st.object_region_info.region_to_objects_map[rid];
+                        if (std::find(ro.begin(), ro.end(), oid) != ro.end())
+                        {
+                            obj_rset.insert(rid);
+                        }
+                    }
+
+                    std::vector<Index> obj_shell_tris;
+                    for (const Index tr_id : candidate_tri_set)
+                    {
+                        const auto& br = st.region_info.tri_to_bounded_regions_map[tr_id];
+                        const bool f_in =
+                          (br.first != NOT_SET_RegionID && obj_rset.count(br.first) > 0);
+                        const bool s_in =
+                          (br.second != NOT_SET_RegionID && obj_rset.count(br.second) > 0);
+                        if (f_in != s_in)
+                        {
+                            obj_shell_tris.push_back(tr_id);
+                        }
+                    }
+
+                    std::vector<int> obj_signs;
+                    if (!orient_closed_manifold_shell(
+                          st,
+                          obj_shell_tris,
+                          [&](Index tid)
+                          { return obj_rset.count(st.region_info.tet_to_region_map[tid]) > 0; },
+                          obj_signs))
+                    {
+                        return false;
+                    }
+
+                    ClosedOrientedShell cs;
+                    cs.a.reserve(obj_shell_tris.size());
+                    cs.b.reserve(obj_shell_tris.size());
+                    cs.c.reserve(obj_shell_tris.size());
+                    for (std::size_t si = 0; si < obj_shell_tris.size(); ++si)
+                    {
+                        const auto& gc          = st.tetrahedralization.triangles[obj_shell_tris[si]];
+                        const Eigen::Vector3d p0 = detail::point_as_vector(
+                          st.tetrahedralization.vertices[gc[0]]);
+                        const Eigen::Vector3d p1 = detail::point_as_vector(
+                          st.tetrahedralization.vertices[gc[1]]);
+                        const Eigen::Vector3d p2 = detail::point_as_vector(
+                          st.tetrahedralization.vertices[gc[2]]);
+                        if (obj_signs[si] > 0)
+                        {
+                            cs.a.push_back(p0);
+                            cs.b.push_back(p1);
+                            cs.c.push_back(p2);
+                        }
+                        else
+                        {
+                            cs.a.push_back(p0);
+                            cs.b.push_back(p2);
+                            cs.c.push_back(p1);
+                        }
+                        cs.bb_min = cs.bb_min.cwiseMin(p0).cwiseMin(p1).cwiseMin(p2);
+                        cs.bb_max = cs.bb_max.cwiseMax(p0).cwiseMax(p1).cwiseMax(p2);
+                    }
+                    obj_shells->emplace(oid, std::move(cs));
+                }
             }
 
             std::vector<Index> local_to_global;
@@ -420,62 +791,19 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
 
             std::vector<ShellTriMeta> shell_tris;
             shell_tris.reserve(shell_tri_ids.size());
-            std::map<std::pair<Index, Index>, int> shell_edge_deg;
-            bool shell_ok     = true;
             double shell_area = 0.0;
             double sum_l2     = 0.0;
             double sum_l1     = 0.0;
 
-            for (const Index tr_id : shell_tri_ids)
+            for (std::size_t si = 0; si < shell_tri_ids.size(); ++si)
             {
+                const Index tr_id = shell_tri_ids[si];
                 const auto& gconn = st.tetrahedralization.triangles[tr_id];
-                const auto& tt    = st.tetrahedralization.tri_to_tet_map[tr_id];
-                Index adj_tet     = NOT_SET_Index;
-                if (tt[0] != NOT_SET_Index && st.region_info.tet_to_region_map[tt[0]] == rid)
-                {
-                    adj_tet = tt[0];
-                }
-                else if (tt[1] != NOT_SET_Index && st.region_info.tet_to_region_map[tt[1]] == rid)
-                {
-                    adj_tet = tt[1];
-                }
-                if (adj_tet == NOT_SET_Index)
-                {
-                    shell_ok = false;
-                    break;
-                }
-
-                Index v_opp = NOT_SET_Index;
-                for (const Index cv : st.tetrahedralization.tetrahedra[adj_tet])
-                {
-                    if (cv != gconn[0] && cv != gconn[1] && cv != gconn[2])
-                    {
-                        v_opp = cv;
-                        break;
-                    }
-                }
-                if (v_opp == NOT_SET_Index)
-                {
-                    shell_ok = false;
-                    break;
-                }
-
-                const double sv =
-                  detail::tetrahedron_signed_volume(st.tetrahedralization.vertices[gconn[0]],
-                                                    st.tetrahedralization.vertices[gconn[1]],
-                                                    st.tetrahedralization.vertices[gconn[2]],
-                                                    st.tetrahedralization.vertices[v_opp]);
-                if (std::abs(sv) <= 1e-30)
-                {
-                    shell_ok = false;
-                    break;
-                }
-
                 ShellTriMeta sm;
-                sm.local_conn = { global_to_local.at(gconn[0]),
-                                  global_to_local.at(gconn[1]),
-                                  global_to_local.at(gconn[2]) };
-                sm.expected_sign = (sv > 0.0) ? +1 : -1;
+                sm.local_conn    = { global_to_local.at(gconn[0]),
+                                     global_to_local.at(gconn[1]),
+                                     global_to_local.at(gconn[2]) };
+                sm.expected_sign = expected_signs[si];
                 sm.a = detail::point_as_vector(st.tetrahedralization.vertices[gconn[0]]);
                 sm.b = detail::point_as_vector(st.tetrahedralization.vertices[gconn[1]]);
                 sm.c = detail::point_as_vector(st.tetrahedralization.vertices[gconn[2]]);
@@ -489,34 +817,10 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                 const double l20 = (sm.a - sm.c).norm();
                 sum_l2 += l01 * l01 + l12 * l12 + l20 * l20;
                 sum_l1 += l01 + l12 + l20;
-
-                for (int e = 0; e < 3; ++e)
-                {
-                    const Index u = sm.local_conn[e];
-                    const Index v = sm.local_conn[(e + 1) % 3];
-                    shell_edge_deg[{ std::min(u, v), std::max(u, v) }] += 1;
-                }
-            }
-
-            if (!shell_ok)
-            {
-                continue;
-            }
-            for (const auto& kv : shell_edge_deg)
-            {
-                if (kv.second < 2 || (kv.second % 2) != 0)
-                {
-                    shell_ok = false;
-                    break;
-                }
-            }
-            if (!shell_ok)
-            {
-                continue;
             }
 
             double reg_vol = 0.0;
-            for (const Index tid : region_tets)
+            for (const Index tid : block_tets)
             {
                 const auto& tc = st.tetrahedralization.tetrahedra[tid];
                 reg_vol += std::max(
@@ -528,25 +832,91 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
             }
             if (reg_vol <= 1e-18 || shell_area <= 1e-16)
             {
-                continue;
+                return false;
             }
 
-            const double h_bnd   = (sum_l1 > 1e-14) ? (sum_l2 / sum_l1) : 1.0;
-            const double h_lens  = 4.0 * reg_vol / shell_area;
-            const double h_floor = std::cbrt(std::max(1e-24, 6.0 * reg_vol / 5500.0));
-            const double h_int   = std::max(std::min(h_bnd, 0.42 * h_lens), h_floor);
-            const double v_max =
-              std::max((std::sqrt(2.0) / 12.0) * h_int * h_int * h_int, reg_vol / 7000.0);
+            const double target_tets = (block_rids.size() >= 2) ? 14000.0 : 5500.0;
+            const double h_bnd       = (sum_l1 > 1e-14) ? (sum_l2 / sum_l1) : 1.0;
+            const double h_lens      = 4.0 * reg_vol / shell_area;
+            const double h_floor     = std::cbrt(std::max(1e-24, 6.0 * reg_vol / target_tets));
+            const double h_int       = std::max(std::min(h_bnd, 0.42 * h_lens), h_floor);
+            const double v_max       = std::max((std::sqrt(2.0) / 12.0) * h_int * h_int * h_int,
+                                                reg_vol / (target_tets * 1.3));
 
-            // Collect well-cleared interior seed points from cross-shell edges and tet centroids
+            std::unordered_set<Index> internal_tri_lookup(internal_tri_ids.begin(),
+                                                          internal_tri_ids.end());
             std::vector<Eigen::Vector3d> cand_seeds;
+
+            // Prioritize volume-weighted centroids (and a symmetric local seed stencil inside
+            // high-multiplicity K >= 3 cores) from highest object multiplicity down to lowest, so
+            // small central multi-material cores always receive well-centered interior vertices.
+            if (block_rids.size() >= 2)
+            {
+                std::vector<RegionID> ordered_rids = block_rids;
+                std::sort(
+                  ordered_rids.begin(),
+                  ordered_rids.end(),
+                  [&](RegionID a, RegionID b)
+                  {
+                      const std::size_t na =
+                        st.object_region_info.region_to_objects_map[a].size();
+                      const std::size_t nb =
+                        st.object_region_info.region_to_objects_map[b].size();
+                      return (na != nb) ? (na > nb) : (a < b);
+                  });
+
+                for (const RegionID rid : ordered_rids)
+                {
+                    if (st.object_region_info.region_to_objects_map[rid].size() < 4)
+                    {
+                        continue;
+                    }
+                    Eigen::Vector3d w_sum = Eigen::Vector3d::Zero();
+                    double v_sum          = 0.0;
+                    for (const Index tid : st.region_info.region_to_tets_map[rid])
+                    {
+                        const auto& tc   = st.tetrahedralization.tetrahedra[tid];
+                        const double vol = std::max(
+                          0.0,
+                          detail::tetrahedron_signed_volume(
+                            st.tetrahedralization.vertices[tc[0]],
+                            st.tetrahedralization.vertices[tc[1]],
+                            st.tetrahedralization.vertices[tc[2]],
+                            st.tetrahedralization.vertices[tc[3]]));
+                        if (vol <= 1e-24)
+                        {
+                            continue;
+                        }
+                        const Eigen::Vector3d ct =
+                          0.25 * (detail::point_as_vector(st.tetrahedralization.vertices[tc[0]]) +
+                                  detail::point_as_vector(st.tetrahedralization.vertices[tc[1]]) +
+                                  detail::point_as_vector(st.tetrahedralization.vertices[tc[2]]) +
+                                  detail::point_as_vector(st.tetrahedralization.vertices[tc[3]]));
+                        w_sum += vol * ct;
+                        v_sum += vol;
+                    }
+                    if (v_sum > 1e-22)
+                    {
+                        cand_seeds.push_back(w_sum / v_sum);
+                    }
+                }
+            }
+
             std::unordered_set<Index> seen_int_edges;
-            for (const Index tid : region_tets)
+            for (const Index tid : block_tets)
             {
                 for (const Index eid : st.tetrahedralization.tet_to_edges_map[tid])
                 {
-                    if (st.tetrahedralization.edge_to_tris_map[eid].empty() &&
-                        seen_int_edges.insert(eid).second)
+                    bool on_outer_shell = false;
+                    for (const auto& tp : st.tetrahedralization.edge_to_tris_map[eid])
+                    {
+                        if (internal_tri_lookup.count(tp.first) == 0)
+                        {
+                            on_outer_shell = true;
+                            break;
+                        }
+                    }
+                    if (!on_outer_shell && seen_int_edges.insert(eid).second)
                     {
                         const auto& ed = st.tetrahedralization.edges[eid];
                         cand_seeds.push_back(0.5 *
@@ -564,16 +934,17 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                           detail::point_as_vector(st.tetrahedralization.vertices[tc[3]])));
             }
 
-            const double min_clear    = std::max(1e-9, 0.14 * std::min(h_int, h_lens));
+            const double min_clear    = std::max(1e-9, 0.18 * std::min(h_int, h_lens));
             const double min_clear_sq = min_clear * min_clear;
-            const double min_sep      = 0.35 * h_int;
+            const double min_sep      = (block_rids.size() >= 2) ? (0.55 * h_int) : (0.35 * h_int);
             const double min_sep_sq   = min_sep * min_sep;
 
             std::vector<Eigen::Vector3d> accepted_seeds;
-            accepted_seeds.reserve(std::min<std::size_t>(cand_seeds.size(), 4000));
+            const std::size_t max_seeds = (block_rids.size() >= 2) ? 2500 : 4000;
+            accepted_seeds.reserve(std::min<std::size_t>(cand_seeds.size(), max_seeds));
             for (const auto& sp : cand_seeds)
             {
-                if (accepted_seeds.size() >= 4000)
+                if (accepted_seeds.size() >= max_seeds)
                 {
                     break;
                 }
@@ -631,10 +1002,10 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                 }
                 for (int i = 0; i < n_seed_verts; ++i)
                 {
-                    const int dst               = n_shell_verts + i;
-                    in.pointlist[3 * dst + 0]   = accepted_seeds[static_cast<std::size_t>(i)].x();
-                    in.pointlist[3 * dst + 1]   = accepted_seeds[static_cast<std::size_t>(i)].y();
-                    in.pointlist[3 * dst + 2]   = accepted_seeds[static_cast<std::size_t>(i)].z();
+                    const int dst             = n_shell_verts + i;
+                    in.pointlist[3 * dst + 0] = accepted_seeds[static_cast<std::size_t>(i)].x();
+                    in.pointlist[3 * dst + 1] = accepted_seeds[static_cast<std::size_t>(i)].y();
+                    in.pointlist[3 * dst + 2] = accepted_seeds[static_cast<std::size_t>(i)].z();
                 }
 
                 in.numberoffacets  = static_cast<int>(shell_tris.size());
@@ -670,7 +1041,7 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                 flags.maxvolume      = v_max;
                 flags.smooth_maxiter = 0;
                 flags.noimprove      = 0;
-                flags.steinerleft    = 15000;
+                flags.steinerleft    = (block_rids.size() >= 2) ? 25000 : 15000;
                 flags.quiet          = 1;
                 flags.verbose        = 0;
                 flags.epsilon        = 1e-14;
@@ -680,11 +1051,10 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
 
                 if (out.numberofpoints < n_shell_verts || out.numberoftetrahedra <= 0)
                 {
-                    continue;
+                    return false;
                 }
 
                 std::vector<Point3> out_pts(static_cast<std::size_t>(out.numberofpoints));
-                bool coords_match = true;
                 for (int i = 0; i < out.numberofpoints; ++i)
                 {
                     out_pts[static_cast<std::size_t>(i)] = { out.pointlist[3 * i + 0],
@@ -696,14 +1066,9 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                           st.tetrahedralization.vertices[local_to_global[static_cast<std::size_t>(i)]];
                         if (detail::distance(out_pts[static_cast<std::size_t>(i)], orig_p) > 1e-11)
                         {
-                            coords_match = false;
-                            break;
+                            return false;
                         }
                     }
-                }
-                if (!coords_match)
-                {
-                    continue;
                 }
 
                 const std::size_t n_out_tets = static_cast<std::size_t>(out.numberoftetrahedra);
@@ -758,22 +1123,68 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                     }
                 }
 
-                std::vector<int> tet_state(n_out_tets, 0); // 0=unvisited, 1=inside, -1=outside
-                std::deque<Index> bfs;
-                bool all_shell_matched = true;
+                // Partition `out_tets` into 3D face-connected components across non-shell faces so
+                // passive zero-volume boundary cap slivers never cause ambiguous orientation bailouts.
+                for (std::size_t si = 0; si < shell_tris.size(); ++si)
+                {
+                    auto key = shell_tris[si].local_conn;
+                    std::sort(key.begin(), key.end());
+                    if (face_inc.find(key) == face_inc.end())
+                    {
+                        return false;
+                    }
+                }
+
+                std::vector<int> tet_comp(n_out_tets, -1);
+                std::vector<bool> comp_touches_hull(0);
+                int n_comps = 0;
+                for (std::size_t seed = 0; seed < n_out_tets; ++seed)
+                {
+                    if (tet_comp[seed] >= 0)
+                    {
+                        continue;
+                    }
+                    const int cid      = n_comps++;
+                    bool touches_outer = false;
+                    std::deque<Index> bfs = { static_cast<Index>(seed) };
+                    tet_comp[seed]        = cid;
+                    while (!bfs.empty())
+                    {
+                        const Index cur = bfs.front();
+                        bfs.pop_front();
+                        const auto& tc = out_tets[cur];
+                        for (ConnIndex f = 0; f < 4; ++f)
+                        {
+                            const auto& fc           = detail::kTetFaces[f];
+                            std::array<Index, 3> key = { tc[fc[0]], tc[fc[1]], tc[fc[2]] };
+                            std::sort(key.begin(), key.end());
+                            if (shell_key_map.count(key) > 0)
+                            {
+                                continue;
+                            }
+                            const Index nb = out_adj[cur][f];
+                            if (nb == NOT_SET_Index)
+                            {
+                                touches_outer = true;
+                                continue;
+                            }
+                            if (tet_comp[nb] < 0)
+                            {
+                                tet_comp[nb] = cid;
+                                bfs.push_back(nb);
+                            }
+                        }
+                    }
+                    comp_touches_hull.push_back(touches_outer);
+                }
+
+                std::vector<double> comp_vote(static_cast<std::size_t>(n_comps), 0.0);
                 for (std::size_t si = 0; si < shell_tris.size(); ++si)
                 {
                     const auto& sm = shell_tris[si];
                     auto key       = sm.local_conn;
                     std::sort(key.begin(), key.end());
-                    const auto it = face_inc.find(key);
-                    if (it == face_inc.end())
-                    {
-                        all_shell_matched = false;
-                        break;
-                    }
-                    bool found_in = false;
-                    for (const auto& [ti, lf] : it->second)
+                    for (const auto& [ti, lf] : face_inc.at(key))
                     {
                         const auto& tc  = out_tets[ti];
                         Index v_opp_loc = NOT_SET_Index;
@@ -795,85 +1206,30 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                           out_pts[sm.local_conn[1]],
                           out_pts[sm.local_conn[2]],
                           out_pts[v_opp_loc]);
-                        const int sgn = (sv > 0.0) ? +1 : -1;
-                        if (sgn == sm.expected_sign)
+                        if (std::abs(sv) > 1e-22)
                         {
-                            found_in = true;
-                            if (tet_state[ti] == -1)
-                            {
-                                all_shell_matched = false;
-                                break;
-                            }
-                            if (tet_state[ti] == 0)
-                            {
-                                tet_state[ti] = 1;
-                                bfs.push_back(ti);
-                            }
-                        }
-                        else
-                        {
-                            if (tet_state[ti] == 1)
-                            {
-                                all_shell_matched = false;
-                                break;
-                            }
-                            tet_state[ti] = -1;
+                            comp_vote[static_cast<std::size_t>(tet_comp[ti])] +=
+                              static_cast<double>(sm.expected_sign) * sv;
                         }
                     }
-                    if (!found_in || !all_shell_matched)
-                    {
-                        all_shell_matched = false;
-                        break;
-                    }
-                }
-                if (!all_shell_matched)
-                {
-                    continue;
                 }
 
-                while (!bfs.empty())
+                std::vector<bool> comp_inside(static_cast<std::size_t>(n_comps), false);
+                for (int cid = 0; cid < n_comps; ++cid)
                 {
-                    const Index cur = bfs.front();
-                    bfs.pop_front();
-                    const auto& tc = out_tets[cur];
-                    for (ConnIndex f = 0; f < 4; ++f)
+                    if (!comp_touches_hull[static_cast<std::size_t>(cid)] &&
+                        comp_vote[static_cast<std::size_t>(cid)] > 0.0)
                     {
-                        const auto& fc           = detail::kTetFaces[f];
-                        std::array<Index, 3> key = { tc[fc[0]], tc[fc[1]], tc[fc[2]] };
-                        std::sort(key.begin(), key.end());
-                        if (shell_key_map.count(key) > 0)
-                        {
-                            continue;
-                        }
-                        const Index nb = out_adj[cur][f];
-                        if (nb == NOT_SET_Index || tet_state[nb] == -1)
-                        {
-                            all_shell_matched = false;
-                            break;
-                        }
-                        if (tet_state[nb] == 0)
-                        {
-                            tet_state[nb] = 1;
-                            bfs.push_back(nb);
-                        }
+                        comp_inside[static_cast<std::size_t>(cid)] = true;
                     }
-                    if (!all_shell_matched)
-                    {
-                        break;
-                    }
-                }
-                if (!all_shell_matched)
-                {
-                    continue;
                 }
 
                 std::vector<std::array<Index, 4>> kept_tets;
                 kept_tets.reserve(n_out_tets);
                 double kept_vol = 0.0;
-                bool vols_pos   = true;
                 for (std::size_t ti = 0; ti < n_out_tets; ++ti)
                 {
-                    if (tet_state[ti] != 1)
+                    if (!comp_inside[static_cast<std::size_t>(tet_comp[ti])])
                     {
                         continue;
                     }
@@ -882,22 +1238,58 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                                                                        out_pts[tc[1]],
                                                                        out_pts[tc[2]],
                                                                        out_pts[tc[3]]);
-                    if (v <= 1e-22)
+                    if (v < -1e-19)
                     {
-                        vols_pos = false;
-                        break;
+                        return false;
                     }
-                    kept_vol += v;
+                    kept_vol += std::max(0.0, v);
                     kept_tets.push_back(tc);
                 }
-                if (!vols_pos || kept_tets.empty() ||
+
+                if (kept_tets.empty() ||
                     std::abs(kept_vol - reg_vol) > 1e-5 * std::max(1.0, reg_vol))
                 {
-                    continue;
+                    return false;
+                }
+
+                // Verify that the boundary of `kept_tets` matches `shell_tris` 1-to-1
+                {
+                    std::unordered_map<std::array<Index, 3>, int, SortedTriKeyHash> kept_face_cnt;
+                    kept_face_cnt.reserve(kept_tets.size() * 3);
+                    for (const auto& tc : kept_tets)
+                    {
+                        for (ConnIndex f = 0; f < 4; ++f)
+                        {
+                            const auto& fc           = detail::kTetFaces[f];
+                            std::array<Index, 3> key = { tc[fc[0]], tc[fc[1]], tc[fc[2]] };
+                            std::sort(key.begin(), key.end());
+                            kept_face_cnt[key] += 1;
+                        }
+                    }
+                    std::size_t n_bnd_faces = 0;
+                    for (const auto& kv : kept_face_cnt)
+                    {
+                        if (kv.second == 1)
+                        {
+                            ++n_bnd_faces;
+                            if (shell_key_map.count(kv.first) == 0)
+                            {
+                                return false;
+                            }
+                        }
+                        else if (kv.second != 2)
+                        {
+                            return false;
+                        }
+                    }
+                    if (n_bnd_faces != shell_tris.size())
+                    {
+                        return false;
+                    }
                 }
 
                 // Smooth newly added strictly-interior vertices (`v >= n_shell_verts`) with
-                // positive-volume guard to optimize tet aspect ratios inside the lens.
+                // positive-volume guard to optimize tet aspect ratios inside the overlap.
                 const std::size_t n_pts_loc = out_pts.size();
                 if (n_pts_loc > static_cast<std::size_t>(n_shell_verts))
                 {
@@ -929,7 +1321,8 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                         nb.erase(std::unique(nb.begin(), nb.end()), nb.end());
                     }
 
-                    for (int iter = 0; iter < 4; ++iter)
+                    const int n_smooth_iters = (block_rids.size() >= 2) ? 6 : 4;
+                    for (int iter = 0; iter < n_smooth_iters; ++iter)
                     {
                         for (std::size_t vi = static_cast<std::size_t>(n_shell_verts);
                              vi < n_pts_loc;
@@ -952,16 +1345,14 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                             avg[2] *= inv_deg;
 
                             const Point3 old_p = out_pts[vi];
-                            double min_before  = std::numeric_limits<double>::max();
-                            for (const Index ti : v_inc_tets[vi])
+                            std::vector<double> before_vols(v_inc_tets[vi].size(), 0.0);
+                            for (std::size_t k = 0; k < v_inc_tets[vi].size(); ++k)
                             {
-                                const auto& tc = kept_tets[ti];
-                                min_before     = std::min(min_before,
-                                                      detail::tetrahedron_signed_volume(
-                                                        out_pts[tc[0]],
-                                                        out_pts[tc[1]],
-                                                        out_pts[tc[2]],
-                                                        out_pts[tc[3]]));
+                                const auto& tc = kept_tets[v_inc_tets[vi][k]];
+                                before_vols[k] = detail::tetrahedron_signed_volume(out_pts[tc[0]],
+                                                                                   out_pts[tc[1]],
+                                                                                   out_pts[tc[2]],
+                                                                                   out_pts[tc[3]]);
                             }
 
                             for (const double alpha : { 0.5, 0.25 })
@@ -970,15 +1361,23 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                                                 (1.0 - alpha) * old_p[1] + alpha * avg[1],
                                                 (1.0 - alpha) * old_p[2] + alpha * avg[2] };
                                 bool ok     = true;
-                                for (const Index ti : v_inc_tets[vi])
+                                for (std::size_t k = 0; k < v_inc_tets[vi].size(); ++k)
                                 {
-                                    const auto& tc = kept_tets[ti];
+                                    const auto& tc  = kept_tets[v_inc_tets[vi][k]];
                                     const double nv =
                                       detail::tetrahedron_signed_volume(out_pts[tc[0]],
                                                                         out_pts[tc[1]],
                                                                         out_pts[tc[2]],
                                                                         out_pts[tc[3]]);
-                                    if (nv < 0.5 * min_before || nv <= 1e-22)
+                                    if (before_vols[k] > 1e-22)
+                                    {
+                                        if (nv < 0.5 * before_vols[k] || nv <= 1e-22)
+                                        {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                    else if (nv < before_vols[k])
                                     {
                                         ok = false;
                                         break;
@@ -994,14 +1393,124 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                     }
                 }
 
-                // Compact used interior vertices and encode indices (global or offset-flagged)
-                RegionReplacement rep;
-                rep.region_id = rid;
+                // Record exact pre-merge outer shell metadata if unifying multiple subregions
+                if (block_rids.size() >= 2)
+                {
+                    for (const Index tr_id : shell_tri_ids)
+                    {
+                        const auto& gc  = st.tetrahedralization.triangles[tr_id];
+                        const auto& br  = st.region_info.tri_to_bounded_regions_map[tr_id];
+                        const RegionID r_in =
+                          (br.first != NOT_SET_RegionID && block_set.count(br.first) > 0)
+                            ? br.first
+                            : br.second;
+                        auto objs = st.object_region_info.region_to_objects_map[r_in];
+                        std::sort(objs.begin(), objs.end());
+                        std::array<Index, 3> skey = { gc[0], gc[1], gc[2] };
+                        std::sort(skey.begin(), skey.end());
+                        auto& dst_objs = ctx.ext_tri_in_objects[skey];
+                        dst_objs.insert(dst_objs.end(), objs.begin(), objs.end());
+                        std::sort(dst_objs.begin(), dst_objs.end());
+                        dst_objs.erase(std::unique(dst_objs.begin(), dst_objs.end()),
+                                       dst_objs.end());
+                    }
+
+                    std::map<Index, std::set<RegionID>> shell_v_objs;
+                    for (const RegionID rid : block_rids)
+                    {
+                        const auto& ro = st.object_region_info.region_to_objects_map[rid];
+                        for (const Index tid : st.region_info.region_to_tets_map[rid])
+                        {
+                            for (const Index gv : st.tetrahedralization.tetrahedra[tid])
+                            {
+                                if (global_to_local.count(gv) > 0)
+                                {
+                                    shell_v_objs[gv].insert(ro.begin(), ro.end());
+                                }
+                            }
+                        }
+                    }
+                    for (auto& kv : shell_v_objs)
+                    {
+                        ctx.orig_shell_vert_objects[kv.first].assign(kv.second.begin(),
+                                                                     kv.second.end());
+                    }
+                    for (const RegionID rid : block_rids)
+                    {
+                        ctx.region_to_obj_shells[rid] = obj_shells;
+                    }
+                }
+
+                // Compact used interior vertices, assign per-tet RegionID, and encode indices
+                BlockReplacement rep;
+                rep.block_rids            = block_rids;
+                rep.deleted_internal_tris = std::move(internal_tri_ids);
                 std::unordered_map<Index, Index> int_remap;
                 rep.new_tets_encoded.reserve(kept_tets.size());
+                rep.new_tet_regions.reserve(kept_tets.size());
                 constexpr Index kIntFlag = (Index{ 1 } << (sizeof(Index) * 8 - 1));
+
                 for (const auto& tc : kept_tets)
                 {
+                    RegionID assigned_r = block_rids[0];
+                    if (block_rids.size() >= 2)
+                    {
+                        const Eigen::Vector3d c_tet =
+                          0.25 * (detail::point_as_vector(out_pts[tc[0]]) +
+                                  detail::point_as_vector(out_pts[tc[1]]) +
+                                  detail::point_as_vector(out_pts[tc[2]]) +
+                                  detail::point_as_vector(out_pts[tc[3]]));
+                        std::vector<RegionID> inside_objs;
+                        for (const auto& okv : *obj_shells)
+                        {
+                            if (okv.second.is_point_inside(c_tet))
+                            {
+                                inside_objs.push_back(okv.first);
+                            }
+                        }
+                        const auto it_exact = mask_to_rid.find(inside_objs);
+                        if (it_exact != mask_to_rid.end())
+                        {
+                            assigned_r = it_exact->second;
+                        }
+                        else
+                        {
+                            int best_score    = std::numeric_limits<int>::min();
+                            double best_d2    = std::numeric_limits<double>::infinity();
+                            for (const auto& mkv : mask_to_rid)
+                            {
+                                std::vector<RegionID> inter;
+                                std::set_intersection(inside_objs.begin(),
+                                                      inside_objs.end(),
+                                                      mkv.first.begin(),
+                                                      mkv.first.end(),
+                                                      std::back_inserter(inter));
+                                const int sym_diff =
+                                  static_cast<int>(inside_objs.size() + mkv.first.size() -
+                                                   2 * inter.size());
+                                const int score =
+                                  2 * static_cast<int>(inter.size()) - sym_diff;
+                                if (score > best_score)
+                                {
+                                    best_score = score;
+                                    assigned_r = mkv.second;
+                                }
+                            }
+                            if (inside_objs.size() < 2 && !orig_tet_centroids.empty())
+                            {
+                                for (const auto& oc : orig_tet_centroids)
+                                {
+                                    const double d2 = (c_tet - oc.first).squaredNorm();
+                                    if (d2 < best_d2)
+                                    {
+                                        best_d2    = d2;
+                                        assigned_r = oc.second;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     std::array<Index, 4> enc;
                     for (int c = 0; c < 4; ++c)
                     {
@@ -1022,19 +1531,110 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                         }
                     }
                     rep.new_tets_encoded.push_back(enc);
+                    rep.new_tet_regions.push_back(assigned_r);
                 }
 
                 replacements.push_back(std::move(rep));
-                tetgen_refined_regions.insert(rid);
+                for (const RegionID rid : block_rids)
+                {
+                    tetgen_refined_regions.insert(rid);
+                }
+                return true;
             }
             catch (...)
             {
-                // Fall through cleanly to edge-splitting fallback for this region
+                return false;
+            }
+        };
+
+        // Group overlap subregions across single-owner removable internal caps so TetGen remeshes
+        // the unified plump overlap volume without locking internal spherical/curved caps in place.
+        const auto groups = find_overlap_region_groups(st.region_boundaries_info,
+                                                       st.object_region_info.regions_of_overlap);
+        for (const auto& grp : groups)
+        {
+            std::set<RegionID> grp_objs;
+            for (const RegionID rid : grp.region_ids)
+            {
+                for (const RegionID oid : st.object_region_info.region_to_objects_map[rid])
+                {
+                    grp_objs.insert(oid);
+                }
+            }
+
+            std::unordered_set<RegionBoundaryID> dissolvable_internal_bids;
+            for (const RegionBoundaryID bid : grp.internal_boundary_ids)
+            {
+                int owner_cnt = 0;
+                for (const RegionID oid : grp_objs)
+                {
+                    const auto& eb =
+                      st.object_region_boundary_info.object_to_external_boundary_ids_map[oid];
+                    if (std::find(eb.begin(), eb.end(), bid) != eb.end())
+                    {
+                        ++owner_cnt;
+                    }
+                }
+                if (owner_cnt == 1)
+                {
+                    dissolvable_internal_bids.insert(bid);
+                }
+            }
+
+            const std::unordered_set<RegionID> grp_rset(grp.region_ids.begin(),
+                                                        grp.region_ids.end());
+            std::unordered_set<RegionID> visited_r;
+            for (const RegionID seed_r : grp.region_ids)
+            {
+                if (visited_r.count(seed_r) > 0)
+                {
+                    continue;
+                }
+                std::vector<RegionID> block_rids;
+                std::deque<RegionID> q_r = { seed_r };
+                visited_r.insert(seed_r);
+                while (!q_r.empty())
+                {
+                    const RegionID cur_r = q_r.front();
+                    q_r.pop_front();
+                    block_rids.push_back(cur_r);
+                    for (const RegionBoundaryID bid :
+                         st.region_boundaries_info.region_id_to_region_boundary_ids_map[cur_r])
+                    {
+                        if (dissolvable_internal_bids.count(bid) == 0)
+                        {
+                            continue;
+                        }
+                        for (const RegionID nb_r :
+                             st.region_boundaries_info.region_boundary_id_to_region_ids_map[bid])
+                        {
+                            if (grp_rset.count(nb_r) > 0 && visited_r.insert(nb_r).second)
+                            {
+                                q_r.push_back(nb_r);
+                            }
+                        }
+                    }
+                }
+
+                if (!run_tetgen_on_block(block_rids) && block_rids.size() >= 2)
+                {
+                    for (const RegionID rid : block_rids)
+                    {
+                        run_tetgen_on_block({ rid });
+                    }
+                }
             }
         }
 
         if (!replacements.empty())
         {
+            std::unordered_set<Index> deleted_tris;
+            for (const auto& rep : replacements)
+            {
+                deleted_tris.insert(rep.deleted_internal_tris.begin(),
+                                    rep.deleted_internal_tris.end());
+            }
+
             std::vector<std::array<Index, 4>> merged_tets;
             std::vector<RegionID> merged_tet_region;
             merged_tets.reserve(st.tetrahedralization.tetrahedra.size() * 2);
@@ -1058,8 +1658,9 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                 {
                     st.tetrahedralization.vertices.push_back(p);
                 }
-                for (auto enc : rep.new_tets_encoded)
+                for (std::size_t k = 0; k < rep.new_tets_encoded.size(); ++k)
                 {
+                    auto enc = rep.new_tets_encoded[k];
                     for (int c = 0; c < 4; ++c)
                     {
                         if ((enc[c] & kIntFlag) != 0)
@@ -1068,15 +1669,49 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                         }
                     }
                     merged_tets.push_back(enc);
-                    merged_tet_region.push_back(rep.region_id);
+                    merged_tet_region.push_back(rep.new_tet_regions[k]);
+                }
+            }
+
+            if (!deleted_tris.empty())
+            {
+                std::vector<std::array<Index, 3>> kept_tris;
+                std::vector<FacetID> kept_tri_facets;
+                std::vector<RegionBoundaryID> kept_tri_bids;
+                const std::size_t n_old_tris = st.tetrahedralization.triangles.size();
+                kept_tris.reserve(n_old_tris - deleted_tris.size());
+                kept_tri_facets.reserve(n_old_tris - deleted_tris.size());
+                kept_tri_bids.reserve(n_old_tris - deleted_tris.size());
+
+                for (std::size_t tr = 0; tr < n_old_tris; ++tr)
+                {
+                    if (deleted_tris.count(static_cast<Index>(tr)) > 0)
+                    {
+                        continue;
+                    }
+                    kept_tris.push_back(st.tetrahedralization.triangles[tr]);
+                    kept_tri_facets.push_back(st.region_info.tri_to_facet_map[tr]);
+                    kept_tri_bids.push_back(
+                      st.region_boundaries_info.triangle_to_boundary_id_map[tr]);
+                }
+
+                st.tetrahedralization.triangles                      = std::move(kept_tris);
+                st.region_info.tri_to_facet_map                      = std::move(kept_tri_facets);
+                st.region_boundaries_info.triangle_to_boundary_id_map = std::move(kept_tri_bids);
+                st.region_boundaries_info.region_boundary_to_triangles_map.assign(
+                  st.region_boundaries_info.n_region_boundaries,
+                  {});
+                for (std::size_t tr = 0; tr < st.tetrahedralization.triangles.size(); ++tr)
+                {
+                    st.region_boundaries_info
+                      .region_boundary_to_triangles_map[st.region_boundaries_info
+                                                          .triangle_to_boundary_id_map[tr]]
+                      .push_back(static_cast<Index>(tr));
                 }
             }
 
             st.tetrahedralization.tetrahedra = std::move(merged_tets);
             update_edges_and_maps(st.tetrahedralization);
-
-            // Rebuild seam edge IDs on updated edge indices
-            st.seams_info = segment_seams(st.tetrahedralization, st.region_boundaries_info);
 
             st.region_info.tet_to_region_map = std::move(merged_tet_region);
             st.region_info.region_to_tets_map.assign(st.region_info.n_regions, {});
@@ -1085,12 +1720,50 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
                 st.region_info.region_to_tets_map[st.region_info.tet_to_region_map[ti]].push_back(
                   static_cast<Index>(ti));
             }
+
+            if (!deleted_tris.empty())
+            {
+                const std::size_t n_cur_tris = st.tetrahedralization.triangles.size();
+                st.region_info.tri_to_bounded_regions_map.assign(
+                  n_cur_tris,
+                  { NOT_SET_RegionID, NOT_SET_RegionID });
+                st.region_info.region_to_bounding_triangles_map.assign(st.region_info.n_regions,
+                                                                       {});
+                for (std::size_t tr = 0; tr < n_cur_tris; ++tr)
+                {
+                    const auto& tt = st.tetrahedralization.tri_to_tet_map[tr];
+                    auto& br       = st.region_info.tri_to_bounded_regions_map[tr];
+                    if (tt[0] != NOT_SET_Index)
+                    {
+                        br.first = st.region_info.tet_to_region_map[tt[0]];
+                        st.region_info.region_to_bounding_triangles_map[br.first].push_back(
+                          static_cast<Index>(tr));
+                    }
+                    if (tt[1] != NOT_SET_Index)
+                    {
+                        br.second = st.region_info.tet_to_region_map[tt[1]];
+                        if (br.second != br.first)
+                        {
+                            st.region_info.region_to_bounding_triangles_map[br.second].push_back(
+                              static_cast<Index>(tr));
+                        }
+                    }
+                    if (br.first > br.second)
+                    {
+                        std::swap(br.first, br.second);
+                    }
+                }
+            }
+
+            // Rebuild seam edge IDs on updated edge indices
+            st.seams_info = segment_seams(st.tetrahedralization, st.region_boundaries_info);
         }
     }
 #endif
 
     // Step 3: Split any remaining strictly-interior cross-shell edges inside overlap regions
-    // (touches ZERO surface triangles, ensuring thin seam wedges always have an interior DOF).
+    // (touches ZERO surface triangles, ensuring thin seam wedges always have an interior DOF),
+    // skipping diagonals of zero-volume coplanar boundary slivers.
     {
         std::vector<bool> is_surface_vert(st.tetrahedralization.vertices.size(), false);
         for (const auto& tr : st.tetrahedralization.triangles)
@@ -1105,6 +1778,16 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
         {
             for (const Index tid : st.region_info.region_to_tets_map[rid])
             {
+                const auto& tc   = st.tetrahedralization.tetrahedra[tid];
+                const double vol = std::abs(
+                  detail::tetrahedron_signed_volume(st.tetrahedralization.vertices[tc[0]],
+                                                    st.tetrahedralization.vertices[tc[1]],
+                                                    st.tetrahedralization.vertices[tc[2]],
+                                                    st.tetrahedralization.vertices[tc[3]]));
+                if (vol <= 1e-18)
+                {
+                    continue;
+                }
                 for (const Index eid : st.tetrahedralization.tet_to_edges_map[tid])
                 {
                     if (st.tetrahedralization.edge_to_tris_map[eid].empty())
@@ -1177,6 +1860,8 @@ void refine_overlap_interiors(SegmentedTetrahedralization& st)
             split_edges(to_split, st);
         }
     }
+
+    return ctx;
 }
 
 struct GroupHarmonicField
@@ -1193,7 +1878,8 @@ struct GroupHarmonicField
 };
 
 GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
-                                                const OverlapRegionGroup& overlap_group)
+                                                const OverlapRegionGroup& overlap_group,
+                                                const OverlapRefinementContext& refine_ctx)
 {
     static std::atomic<int> overlap_count{ 0 };
     const int overlap_index = overlap_count.fetch_add(1, std::memory_order_relaxed);
@@ -1282,19 +1968,67 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
     }
 
     std::vector<std::vector<bool>> vertex_present_objects(n_verts, std::vector<bool>(K, false));
+    std::vector<bool> vert_evaluated_via_shells(n_verts, false);
     for (const RegionID region_id : overlap_regions_group)
     {
-        const auto& r_mask = region_has_local_obj.at(region_id);
+        const auto& r_mask     = region_has_local_obj.at(region_id);
+        const auto it_shells   = refine_ctx.region_to_obj_shells.find(region_id);
+        const bool has_u_shell = (it_shells != refine_ctx.region_to_obj_shells.end() &&
+                                  it_shells->second != nullptr);
         for (const Index tet_id : sf.region_info.region_to_tets_map[region_id])
         {
             for (const Index g_vid : sf.tetrahedralization.tetrahedra[tet_id])
             {
                 const int lv = static_cast<int>(out.global_to_overlap_vertex_map.at(g_vid));
-                for (int k = 0; k < K; ++k)
+                if (!has_u_shell)
                 {
-                    if (r_mask[k])
+                    for (int k = 0; k < K; ++k)
                     {
-                        vertex_present_objects[lv][k] = true;
+                        if (r_mask[k])
+                        {
+                            vertex_present_objects[lv][k] = true;
+                        }
+                    }
+                }
+                else if (!vert_evaluated_via_shells[lv])
+                {
+                    vert_evaluated_via_shells[lv] = true;
+                    const auto it_orig            = refine_ctx.orig_shell_vert_objects.find(g_vid);
+                    if (it_orig != refine_ctx.orig_shell_vert_objects.end())
+                    {
+                        for (const RegionID obj_id : it_orig->second)
+                        {
+                            const auto it_k = out.object_id_to_local_id_map.find(obj_id);
+                            if (it_k != out.object_id_to_local_id_map.end())
+                            {
+                                vertex_present_objects[lv][it_k->second] = true;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        const Eigen::Vector3d p_v = V_ov.row(lv).transpose();
+                        bool any_inside           = false;
+                        for (const auto& skv : *(it_shells->second))
+                        {
+                            const auto it_k = out.object_id_to_local_id_map.find(skv.first);
+                            if (it_k != out.object_id_to_local_id_map.end() &&
+                                skv.second.is_point_inside(p_v))
+                            {
+                                vertex_present_objects[lv][it_k->second] = true;
+                                any_inside                               = true;
+                            }
+                        }
+                        if (!any_inside)
+                        {
+                            for (int k = 0; k < K; ++k)
+                            {
+                                if (r_mask[k])
+                                {
+                                    vertex_present_objects[lv][k] = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1352,22 +2086,41 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
 
         for (const Index tri_id : sf.region_boundaries_info.region_boundary_to_triangles_map[b_id])
         {
-            const auto& br = sf.region_info.tri_to_bounded_regions_map[tri_id];
+            const auto& gc            = sf.tetrahedralization.triangles[tri_id];
+            std::array<Index, 3> skey = { gc[0], gc[1], gc[2] };
+            std::sort(skey.begin(), skey.end());
+
             std::vector<bool> c_in(K, false);
-            if (br.first != NOT_SET_RegionID && group_region_set.count(br.first) > 0)
+            const auto it_ext = refine_ctx.ext_tri_in_objects.find(skey);
+            if (it_ext != refine_ctx.ext_tri_in_objects.end())
             {
-                const auto& m = region_has_local_obj.at(br.first);
-                for (int k = 0; k < K; ++k)
+                for (const RegionID obj_id : it_ext->second)
                 {
-                    c_in[k] = c_in[k] || m[k];
+                    const auto it_k = out.object_id_to_local_id_map.find(obj_id);
+                    if (it_k != out.object_id_to_local_id_map.end())
+                    {
+                        c_in[it_k->second] = true;
+                    }
                 }
             }
-            if (br.second != NOT_SET_RegionID && group_region_set.count(br.second) > 0)
+            else
             {
-                const auto& m = region_has_local_obj.at(br.second);
-                for (int k = 0; k < K; ++k)
+                const auto& br = sf.region_info.tri_to_bounded_regions_map[tri_id];
+                if (br.first != NOT_SET_RegionID && group_region_set.count(br.first) > 0)
                 {
-                    c_in[k] = c_in[k] || m[k];
+                    const auto& m = region_has_local_obj.at(br.first);
+                    for (int k = 0; k < K; ++k)
+                    {
+                        c_in[k] = c_in[k] || m[k];
+                    }
+                }
+                if (br.second != NOT_SET_RegionID && group_region_set.count(br.second) > 0)
+                {
+                    const auto& m = region_has_local_obj.at(br.second);
+                    for (int k = 0; k < K; ++k)
+                    {
+                        c_in[k] = c_in[k] || m[k];
+                    }
                 }
             }
 
@@ -1449,7 +2202,8 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
         {
             continue;
         }
-        const double l_rms_cubed = l_rms_sq * std::sqrt(l_rms_sq);
+        const double l_rms       = std::sqrt(l_rms_sq);
+        const double l_rms_cubed = l_rms_sq * l_rms;
 
         double six_v = (q[1] - q[0]).dot((q[2] - q[0]).cross(q[3] - q[0]));
         if (six_v < 0.0)
@@ -1458,17 +2212,24 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
             std::swap(q[1], q[2]);
             six_v = -six_v;
         }
-        const double six_v_eff = std::max(six_v, 1e-6 * l_rms_cubed);
 
         const Eigen::Vector3d M[4] = { (q[2] - q[1]).cross(q[3] - q[1]),
                                        (q[3] - q[0]).cross(q[2] - q[0]),
                                        (q[1] - q[0]).cross(q[3] - q[0]),
                                        (q[2] - q[0]).cross(q[1] - q[0]) };
-        const double inv_36_vol    = 1.0 / (6.0 * six_v_eff);
+
+        // Smooth Tikhonov sliver damping: inv_36_vol = (6V) / (6 * ((6V)^2 + tau_v^2)).
+        // Reproduces exact P1 Galerkin stiffness on well-shaped tetrahedra while smoothly
+        // sending flat/coplanar cap sliver stiffness to zero instead of 10^5x short-circuits.
+        const double tau_v      = 1.0e-2 * l_rms_cubed;
+        const double inv_36_vol = (six_v > 0.0)
+                                    ? (six_v / (6.0 * (six_v * six_v + tau_v * tau_v)))
+                                    : 0.0;
+        const double eps_iso    = 1.0e-6 * l_rms;
 
         for (int a = 0; a < 4; ++a)
         {
-            const double k_aa = M[a].squaredNorm() * inv_36_vol;
+            const double k_aa = M[a].squaredNorm() * inv_36_vol + 3.0 * eps_iso;
             if (!std::isfinite(k_aa))
             {
                 continue;
@@ -1477,7 +2238,7 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
             diag_accum[vid[a]] += k_aa;
             for (int b = a + 1; b < 4; ++b)
             {
-                const double k_ab = M[a].dot(M[b]) * inv_36_vol;
+                const double k_ab = M[a].dot(M[b]) * inv_36_vol - eps_iso;
                 if (std::isfinite(k_ab))
                 {
                     a_triplets.emplace_back(vid[a], vid[b], k_ab);
@@ -1820,6 +2581,7 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
 
     std::vector<bool> snapped_interior(n_verts, false);
     std::vector<double> snap_gap(n_verts, 1.0);
+    std::vector<int> cand_quad_verts;
     for (int v = 0; v < n_verts; ++v)
     {
         if (!seam_tied_local_objs[v].empty())
@@ -1835,47 +2597,87 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
             bool did_snap = false;
             if (!is_tracked_surf_local[v] && !has_active_cap[v] && K >= 2)
             {
-                int k1 = -1, k2 = -1;
-                double w1 = -1.0, w2 = -1.0, w3 = -1.0;
+                std::vector<std::pair<double, int>> wk_list;
+                wk_list.reserve(static_cast<std::size_t>(K));
                 for (int k = 0; k < K; ++k)
                 {
-                    if (!vertex_present_objects[v][k])
+                    if (vertex_present_objects[v][k])
                     {
-                        continue;
-                    }
-                    const double wk = out.weights[k](v);
-                    if (wk > w1)
-                    {
-                        w3 = w2;
-                        w2 = w1;
-                        k2 = k1;
-                        w1 = wk;
-                        k1 = k;
-                    }
-                    else if (wk > w2)
-                    {
-                        w3 = w2;
-                        w2 = wk;
-                        k2 = k;
-                    }
-                    else if (wk > w3)
-                    {
-                        w3 = wk;
+                        wk_list.emplace_back(out.weights[k](v), k);
                     }
                 }
-                if (k1 >= 0 && k2 >= 0 && w1 > 0.35 && (w1 - w2) < 0.014 && (w2 - w3) > 0.06)
+                std::sort(wk_list.begin(),
+                          wk_list.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+                const std::size_t np = wk_list.size();
+
+                if (np >= 4 && wk_list[0].first > 0.20 &&
+                    (wk_list[0].first - wk_list[3].first) < 0.065 &&
+                    (np == 4 || (wk_list[3].first - wk_list[4].first) > 0.04))
                 {
-                    out.vertex_label_sets[v] = { out.local_id_to_object_id_map[k1],
-                                                 out.local_id_to_object_id_map[k2] };
+                    out.vertex_label_sets[v] = {
+                        out.local_id_to_object_id_map[wk_list[0].second],
+                        out.local_id_to_object_id_map[wk_list[1].second],
+                        out.local_id_to_object_id_map[wk_list[2].second],
+                        out.local_id_to_object_id_map[wk_list[3].second]
+                    };
                     std::sort(out.vertex_label_sets[v].begin(), out.vertex_label_sets[v].end());
                     snapped_interior[v] = true;
-                    snap_gap[v]         = w1 - w2;
+                    snap_gap[v]         = wk_list[0].first - wk_list[3].first;
+                    cand_quad_verts.push_back(v);
+                    did_snap = true;
+                }
+                else if (np >= 2 && wk_list[0].first > 0.35 &&
+                         (wk_list[0].first - wk_list[1].first) < 0.014 &&
+                         (np == 2 || (wk_list[1].first - wk_list[2].first) > 0.06))
+                {
+                    out.vertex_label_sets[v] = {
+                        out.local_id_to_object_id_map[wk_list[0].second],
+                        out.local_id_to_object_id_map[wk_list[1].second]
+                    };
+                    std::sort(out.vertex_label_sets[v].begin(), out.vertex_label_sets[v].end());
+                    snapped_interior[v] = true;
+                    snap_gap[v]         = wk_list[0].first - wk_list[1].first;
                     did_snap            = true;
                 }
             }
             if (!did_snap)
             {
                 out.vertex_label_sets[v] = { pick_single_winner(v) };
+            }
+        }
+    }
+
+    // Keep at most one 4-way snapped vertex per 2-hop neighborhood (isolated 0D quadruple point),
+    // and clear other interior-snapped vertices in its immediate 1-ring so its surrounding ball
+    // cones cleanly.
+    if (!cand_quad_verts.empty())
+    {
+        std::sort(cand_quad_verts.begin(),
+                  cand_quad_verts.end(),
+                  [&](int a, int b) { return snap_gap[a] < snap_gap[b]; });
+        std::vector<bool> blocked_quad(n_verts, false);
+        for (const int qv : cand_quad_verts)
+        {
+            if (blocked_quad[qv])
+            {
+                snapped_interior[qv]      = false;
+                out.vertex_label_sets[qv] = { pick_single_winner(qv) };
+                continue;
+            }
+            blocked_quad[qv] = true;
+            for (const int nb1 : adj[qv])
+            {
+                blocked_quad[nb1] = true;
+                if (snapped_interior[nb1])
+                {
+                    snapped_interior[nb1]      = false;
+                    out.vertex_label_sets[nb1] = { pick_single_winner(nb1) };
+                }
+                for (const int nb2 : adj[nb1])
+                {
+                    blocked_quad[nb2] = true;
+                }
             }
         }
     }
@@ -1897,9 +2699,18 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
             auto worst_it = std::max_element(
               snap_vs.begin(),
               snap_vs.end(),
-              [&](int a, int b) { return snap_gap[a] < snap_gap[b]; });
-            const int drop_v             = *worst_it;
-            snapped_interior[drop_v]     = false;
+              [&](int a, int b)
+              {
+                  const std::size_t sa = out.vertex_label_sets[a].size();
+                  const std::size_t sb = out.vertex_label_sets[b].size();
+                  if (sa != sb)
+                  {
+                      return sa > sb; // prefer keeping higher-order junction if tied, drop lower-order
+                  }
+                  return snap_gap[a] < snap_gap[b];
+              });
+            const int drop_v              = *worst_it;
+            snapped_interior[drop_v]      = false;
             out.vertex_label_sets[drop_v] = { pick_single_winner(drop_v) };
             snap_vs.erase(worst_it);
         }
@@ -1942,6 +2753,22 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
         }
         return false;
     };
+    auto sets_intersect4 = [](const std::vector<RegionID>& a,
+                              const std::vector<RegionID>& b,
+                              const std::vector<RegionID>& c,
+                              const std::vector<RegionID>& d)
+    {
+        for (const RegionID x : a)
+        {
+            if (std::binary_search(b.begin(), b.end(), x) &&
+                std::binary_search(c.begin(), c.end(), x) &&
+                std::binary_search(d.begin(), d.end(), x))
+            {
+                return true;
+            }
+        }
+        return false;
+    };
 
     for (int t = 0; t < n_tets; ++t)
     {
@@ -1956,18 +2783,39 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
             if (sets_intersect(lu, lv) && sets_intersect(lv, lw) && sets_intersect(lu, lw) &&
                 !sets_intersect3(lu, lv, lw))
             {
-                snapped_interior[u]      = false;
-                snapped_interior[v]      = false;
-                snapped_interior[w]      = false;
-                out.vertex_label_sets[u] = { pick_single_winner(u) };
-                out.vertex_label_sets[v] = { pick_single_winner(v) };
-                out.vertex_label_sets[w] = { pick_single_winner(w) };
+                for (const int z : { u, v, w })
+                {
+                    if (snapped_interior[z])
+                    {
+                        snapped_interior[z]      = false;
+                        out.vertex_label_sets[z] = { pick_single_winner(z) };
+                    }
+                }
+            }
+        }
+
+        const int c0 = T_ov(t, 0), c1 = T_ov(t, 1), c2 = T_ov(t, 2), c3 = T_ov(t, 3);
+        const auto& l0 = out.vertex_label_sets[c0];
+        const auto& l1 = out.vertex_label_sets[c1];
+        const auto& l2 = out.vertex_label_sets[c2];
+        const auto& l3 = out.vertex_label_sets[c3];
+        if (sets_intersect(l0, l1) && sets_intersect(l0, l2) && sets_intersect(l0, l3) &&
+            sets_intersect(l1, l2) && sets_intersect(l1, l3) && sets_intersect(l2, l3) &&
+            !sets_intersect4(l0, l1, l2, l3))
+        {
+            for (const int z : { c0, c1, c2, c3 })
+            {
+                if (snapped_interior[z])
+                {
+                    snapped_interior[z]      = false;
+                    out.vertex_label_sets[z] = { pick_single_winner(z) };
+                }
             }
         }
     }
 
-    // Gently project snapped interior vertices onto the local P1 zero-isosurface (w_a - w_b = 0)
-    // whenever all incident tetrahedra maintain >= 40% of their positive volume.
+    // Project snapped interior vertices (2-way sheet, 3-way junction curve, or 4-way quadruple
+    // point) onto the exact local P1 equal-weight manifold via minimum-norm Gauss-Newton step.
     {
         std::vector<std::vector<Index>> snapped_inc_tets(n_verts);
         for (int t = 0; t < n_tets; ++t)
@@ -1985,20 +2833,30 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
 
         for (int lv = 0; lv < n_verts; ++lv)
         {
-            if (!snapped_interior[lv] || out.vertex_label_sets[lv].size() != 2 ||
-                snapped_inc_tets[lv].empty())
+            const std::size_t m_tied = out.vertex_label_sets[lv].size();
+            if (!snapped_interior[lv] || m_tied < 2 || m_tied > 4 || snapped_inc_tets[lv].empty())
             {
                 continue;
             }
-            const int ka     = static_cast<int>(out.object_id_to_local_id_map.at(out.vertex_label_sets[lv][0]));
-            const int kb     = static_cast<int>(out.object_id_to_local_id_map.at(out.vertex_label_sets[lv][1]));
-            const double d_v = out.weights[ka](lv) - out.weights[kb](lv);
-            if (std::abs(d_v) <= 1e-12)
+            const int r = static_cast<int>(m_tied) - 1;
+            std::array<int, 4> k_tied = { 0, 0, 0, 0 };
+            for (std::size_t j = 0; j < m_tied; ++j)
+            {
+                k_tied[j] =
+                  static_cast<int>(out.object_id_to_local_id_map.at(out.vertex_label_sets[lv][j]));
+            }
+
+            Eigen::VectorXd f_vec(r);
+            for (int m_idx = 0; m_idx < r; ++m_idx)
+            {
+                f_vec(m_idx) = out.weights[k_tied[0]](lv) - out.weights[k_tied[m_idx + 1]](lv);
+            }
+            if (f_vec.norm() <= 1e-12)
             {
                 continue;
             }
 
-            Eigen::Vector3d grad_sum = Eigen::Vector3d::Zero();
+            Eigen::MatrixXd grad_sum = Eigen::MatrixXd::Zero(r, 3);
             double vol_sum           = 0.0;
             double max_edge_len      = 0.0;
             double min_vol_before    = std::numeric_limits<double>::max();
@@ -2028,60 +2886,84 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
                 em.col(2) = q3 - q0;
                 max_edge_len =
                   std::max({ max_edge_len, em.col(0).norm(), em.col(1).norm(), em.col(2).norm() });
+                const auto qr = em.transpose().colPivHouseholderQr();
 
-                double d_c[4];
-                for (int c = 0; c < 4; ++c)
+                for (int m_idx = 0; m_idx < r; ++m_idx)
                 {
-                    const int clv = static_cast<int>(out.global_to_overlap_vertex_map.at(tc[c]));
-                    d_c[c]        = out.weights[ka](clv) - out.weights[kb](clv);
+                    double d_c[4];
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        const int clv =
+                          static_cast<int>(out.global_to_overlap_vertex_map.at(tc[c]));
+                        d_c[c] =
+                          out.weights[k_tied[0]](clv) - out.weights[k_tied[m_idx + 1]](clv);
+                    }
+                    const Eigen::Vector3d rhs_d(d_c[1] - d_c[0], d_c[2] - d_c[0], d_c[3] - d_c[0]);
+                    const Eigen::Vector3d g_tet = qr.solve(rhs_d);
+                    if (g_tet.allFinite())
+                    {
+                        grad_sum.row(m_idx) += v_tet * g_tet.transpose();
+                    }
                 }
-                const Eigen::Vector3d rhs_d(d_c[1] - d_c[0], d_c[2] - d_c[0], d_c[3] - d_c[0]);
-                const Eigen::Vector3d g_tet = em.transpose().colPivHouseholderQr().solve(rhs_d);
-                if (g_tet.allFinite())
-                {
-                    grad_sum += v_tet * g_tet;
-                    vol_sum += v_tet;
-                }
+                vol_sum += v_tet;
             }
 
             if (vol_sum <= 1e-22 || min_vol_before <= 1e-22)
             {
                 continue;
             }
-            const Eigen::Vector3d grad_d = grad_sum / vol_sum;
-            const double g_norm2         = grad_d.squaredNorm();
-            if (g_norm2 <= 1e-20)
+            const Eigen::MatrixXd J  = grad_sum / vol_sum;
+            const double j_norm2     = J.squaredNorm();
+            if (j_norm2 <= 1e-20)
             {
                 continue;
             }
 
-            Eigen::Vector3d step = -(d_v / g_norm2) * grad_d;
-            const double step_n  = step.norm();
-            if (step_n > 0.20 * max_edge_len)
+            Eigen::MatrixXd jjt =
+              J * J.transpose() + (1e-12 * j_norm2) * Eigen::MatrixXd::Identity(r, r);
+            const Eigen::VectorXd y = jjt.ldlt().solve(f_vec);
+            if (!y.allFinite())
             {
-                step *= (0.20 * max_edge_len / step_n);
+                continue;
+            }
+
+            Eigen::Vector3d step   = -J.transpose() * y;
+            const double max_allow = ((m_tied >= 3) ? 0.35 : 0.20) * max_edge_len;
+            const double step_n    = step.norm();
+            if (step_n > max_allow)
+            {
+                step *= (max_allow / step_n);
             }
 
             const Point3 old_p = sf.tetrahedralization.vertices[gv];
-            sf.tetrahedralization.vertices[gv] = { old_p[0] + step.x(),
-                                                   old_p[1] + step.y(),
-                                                   old_p[2] + step.z() };
-            bool ok = true;
-            for (const Index g_tid : snapped_inc_tets[lv])
+            bool accepted      = false;
+            for (const double backoff : { 1.0, 0.5, 0.25 })
             {
-                const auto& tc  = sf.tetrahedralization.tetrahedra[g_tid];
-                const double nv = detail::tetrahedron_signed_volume(
-                  sf.tetrahedralization.vertices[tc[0]],
-                  sf.tetrahedralization.vertices[tc[1]],
-                  sf.tetrahedralization.vertices[tc[2]],
-                  sf.tetrahedralization.vertices[tc[3]]);
-                if (nv < 0.45 * min_vol_before || nv <= 1e-22)
+                sf.tetrahedralization.vertices[gv] = { old_p[0] + backoff * step.x(),
+                                                       old_p[1] + backoff * step.y(),
+                                                       old_p[2] + backoff * step.z() };
+                bool ok                            = true;
+                for (const Index g_tid : snapped_inc_tets[lv])
                 {
-                    ok = false;
+                    const auto& tc  = sf.tetrahedralization.tetrahedra[g_tid];
+                    const double nv = detail::tetrahedron_signed_volume(
+                      sf.tetrahedralization.vertices[tc[0]],
+                      sf.tetrahedralization.vertices[tc[1]],
+                      sf.tetrahedralization.vertices[tc[2]],
+                      sf.tetrahedralization.vertices[tc[3]]);
+                    if (nv < 0.35 * min_vol_before || nv <= 1e-22)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok)
+                {
+                    accepted = true;
                     break;
                 }
             }
-            if (!ok)
+            if (!accepted)
             {
                 sf.tetrahedralization.vertices[gv] = old_p;
             }
@@ -2089,6 +2971,16 @@ GroupHarmonicField compute_group_harmonic_field(SegmentedTetrahedralization& sf,
             {
                 V_ov.row(lv) =
                   detail::point_as_vector(sf.tetrahedralization.vertices[gv]).transpose();
+                double w_mean = 0.0;
+                for (std::size_t j = 0; j < m_tied; ++j)
+                {
+                    w_mean += out.weights[k_tied[j]](lv);
+                }
+                w_mean /= static_cast<double>(m_tied);
+                for (std::size_t j = 0; j < m_tied; ++j)
+                {
+                    out.weights[k_tied[j]](lv) = w_mean;
+                }
             }
         }
     }
@@ -2446,6 +3338,134 @@ void subdivide_and_partition_overlaps(const CombinedSurfaces& inconsistent_combi
 
     std::unordered_map<std::array<Index, 3>, Index, SortedTriKeyHash> face_steiner_map;
 
+    auto dominant_local_obj_at_vert = [](const GroupHarmonicField& gf, Index g_vid) -> int
+    {
+        const auto it_lv = gf.global_to_overlap_vertex_map.find(g_vid);
+        if (it_lv == gf.global_to_overlap_vertex_map.end())
+        {
+            return -1;
+        }
+        const int lv     = static_cast<int>(it_lv->second);
+        const auto& lset = gf.vertex_label_sets[lv];
+        int best_k       = -1;
+        double best_w    = -1.0;
+        for (const RegionID oid : lset)
+        {
+            const int k   = static_cast<int>(gf.object_id_to_local_id_map.at(oid));
+            const double w = gf.weights[k](lv);
+            if (best_k < 0 || w > best_w)
+            {
+                best_w = w;
+                best_k = k;
+            }
+        }
+        return best_k;
+    };
+
+    // Pre-compute exact P1 triple-junction face Steiner points (`w_{k0} = w_{k1} = w_{k2}`)
+    // on all 3-cut overlap faces before tet subdivision.
+    for (const auto& gf : group_fields)
+    {
+        for (const Index tet_id : gf.tets_in_overlap)
+        {
+            const auto& conn = st.tetrahedralization.tetrahedra[tet_id];
+            for (int f = 0; f < 4; ++f)
+            {
+                const auto& fc            = detail::kTetFaces[f];
+                std::array<Index, 3> s    = { conn[fc[0]], conn[fc[1]], conn[fc[2]] };
+                std::sort(s.begin(), s.end());
+                if (face_steiner_map.count(s) > 0)
+                {
+                    continue;
+                }
+                const auto it01 = edge_cut_map.find(hash_linear_edge(s[0], s[1]));
+                const auto it12 = edge_cut_map.find(hash_linear_edge(s[1], s[2]));
+                const auto it02 = edge_cut_map.find(hash_linear_edge(s[0], s[2]));
+                if (it01 == edge_cut_map.end() || it12 == edge_cut_map.end() ||
+                    it02 == edge_cut_map.end())
+                {
+                    continue;
+                }
+
+                const int k0 = dominant_local_obj_at_vert(gf, s[0]);
+                const int k1 = dominant_local_obj_at_vert(gf, s[1]);
+                const int k2 = dominant_local_obj_at_vert(gf, s[2]);
+                if (k0 < 0 || k1 < 0 || k2 < 0 || k0 == k1 || k1 == k2 || k0 == k2)
+                {
+                    continue;
+                }
+
+                const int lv[3] = { static_cast<int>(gf.global_to_overlap_vertex_map.at(s[0])),
+                                    static_cast<int>(gf.global_to_overlap_vertex_map.at(s[1])),
+                                    static_cast<int>(gf.global_to_overlap_vertex_map.at(s[2])) };
+                const double d1[3] = { gf.weights[k0](lv[0]) - gf.weights[k1](lv[0]),
+                                       gf.weights[k0](lv[1]) - gf.weights[k1](lv[1]),
+                                       gf.weights[k0](lv[2]) - gf.weights[k1](lv[2]) };
+                const double d2[3] = { gf.weights[k0](lv[0]) - gf.weights[k2](lv[0]),
+                                       gf.weights[k0](lv[1]) - gf.weights[k2](lv[1]),
+                                       gf.weights[k0](lv[2]) - gf.weights[k2](lv[2]) };
+
+                Eigen::Matrix2d mat2;
+                mat2(0, 0) = d1[1] - d1[0];
+                mat2(0, 1) = d1[2] - d1[0];
+                mat2(1, 0) = d2[1] - d2[0];
+                mat2(1, 1) = d2[2] - d2[0];
+                const double det2 = mat2.determinant();
+                if (std::abs(det2) <= 1e-14)
+                {
+                    continue;
+                }
+                const Eigen::Vector2d lam12 =
+                  mat2.inverse() * Eigen::Vector2d(-d1[0], -d2[0]);
+                const double l1 = lam12.x();
+                const double l2 = lam12.y();
+                const double l0 = 1.0 - l1 - l2;
+                if (!std::isfinite(l0) || !std::isfinite(l1) || !std::isfinite(l2) ||
+                    l0 < 0.02 || l1 < 0.02 || l2 < 0.02)
+                {
+                    continue;
+                }
+
+                const Eigen::Vector3d ps0 =
+                  detail::point_as_vector(st.tetrahedralization.vertices[s[0]]);
+                const Eigen::Vector3d ps1 =
+                  detail::point_as_vector(st.tetrahedralization.vertices[s[1]]);
+                const Eigen::Vector3d ps2 =
+                  detail::point_as_vector(st.tetrahedralization.vertices[s[2]]);
+                const Eigen::Vector3d pf_vec = l0 * ps0 + l1 * ps1 + l2 * ps2;
+
+                const Eigen::Vector3d fn    = (ps1 - ps0).cross(ps2 - ps0);
+                const double fn_norm2       = fn.squaredNorm();
+                if (fn_norm2 <= 1e-28)
+                {
+                    continue;
+                }
+                const Eigen::Vector3d q01 =
+                  detail::point_as_vector(st.tetrahedralization.vertices[it01->second]);
+                const Eigen::Vector3d q12 =
+                  detail::point_as_vector(st.tetrahedralization.vertices[it12->second]);
+                const Eigen::Vector3d q02 =
+                  detail::point_as_vector(st.tetrahedralization.vertices[it02->second]);
+
+                auto sub_ok = [&](const Eigen::Vector3d& u,
+                                  const Eigen::Vector3d& v,
+                                  const Eigen::Vector3d& w) -> bool
+                { return (v - u).cross(w - u).dot(fn) > 1e-4 * fn_norm2; };
+
+                if (!sub_ok(ps0, q01, pf_vec) || !sub_ok(ps0, pf_vec, q02) ||
+                    !sub_ok(ps1, q12, pf_vec) || !sub_ok(ps1, pf_vec, q01) ||
+                    !sub_ok(ps2, q02, pf_vec) || !sub_ok(ps2, pf_vec, q12))
+                {
+                    continue;
+                }
+
+                const Index pf_vid = static_cast<Index>(st.tetrahedralization.vertices.size());
+                st.tetrahedralization.vertices.push_back({ pf_vec.x(), pf_vec.y(), pf_vec.z() });
+                face_steiner_map.emplace(s, pf_vid);
+            }
+        }
+    }
+
     std::vector<RegionID> orig_region_owner(st.region_info.n_regions, NOT_SET_RegionID);
     for (RegionID r = 0; r < st.region_info.n_regions; ++r)
     {
@@ -2731,6 +3751,31 @@ void subdivide_and_partition_overlaps(const CombinedSurfaces& inconsistent_combi
 
                 if (!handled_without_tet_steiner)
                 {
+                    std::vector<std::array<Index, 3>> all_face_sub_tris;
+                    all_face_sub_tris.reserve(24);
+                    std::vector<std::array<Index, 3>> face_sub_tris;
+                    std::vector<Index> tet_face_steiners;
+                    for (int f = 0; f < 4; ++f)
+                    {
+                        const auto& fc         = detail::kTetFaces[f];
+                        std::array<Index, 3> s = { conn[fc[0]], conn[fc[1]], conn[fc[2]] };
+                        face_sub_tris.clear();
+                        subdivide_face_canonically(s,
+                                                   edge_cut_map,
+                                                   face_steiner_map,
+                                                   st.tetrahedralization.vertices,
+                                                   face_sub_tris);
+                        all_face_sub_tris.insert(all_face_sub_tris.end(),
+                                                 face_sub_tris.begin(),
+                                                 face_sub_tris.end());
+                        std::sort(s.begin(), s.end());
+                        const auto it_fs = face_steiner_map.find(s);
+                        if (it_fs != face_steiner_map.end())
+                        {
+                            tet_face_steiners.push_back(it_fs->second);
+                        }
+                    }
+
                     Point3 p_center = { 0.0, 0.0, 0.0 };
                     for (const auto& ec : tet_cuts)
                     {
@@ -2744,28 +3789,106 @@ void subdivide_and_partition_overlaps(const CombinedSurfaces& inconsistent_combi
                     p_center[1] *= inv_n;
                     p_center[2] *= inv_n;
 
+                    if (is_ov)
+                    {
+                        const auto& gf = group_fields[g_idx];
+                        const int kc[4] = { dominant_local_obj_at_vert(gf, conn[0]),
+                                            dominant_local_obj_at_vert(gf, conn[1]),
+                                            dominant_local_obj_at_vert(gf, conn[2]),
+                                            dominant_local_obj_at_vert(gf, conn[3]) };
+
+                        bool has_cand_p = false;
+                        Point3 cand_p   = p_center;
+
+                        if (kc[0] >= 0 && kc[1] >= 0 && kc[2] >= 0 && kc[3] >= 0 &&
+                            kc[0] != kc[1] && kc[0] != kc[2] && kc[0] != kc[3] &&
+                            kc[1] != kc[2] && kc[1] != kc[3] && kc[2] != kc[3])
+                        {
+                            // Exact P1 quadruple junction point (`w_{kc0} = w_{kc1} = w_{kc2} = w_{kc3}`)
+                            const int lv[4] = {
+                                static_cast<int>(gf.global_to_overlap_vertex_map.at(conn[0])),
+                                static_cast<int>(gf.global_to_overlap_vertex_map.at(conn[1])),
+                                static_cast<int>(gf.global_to_overlap_vertex_map.at(conn[2])),
+                                static_cast<int>(gf.global_to_overlap_vertex_map.at(conn[3]))
+                            };
+                            Eigen::Matrix3d mat3;
+                            Eigen::Vector3d rhs3;
+                            for (int m = 0; m < 3; ++m)
+                            {
+                                const int km   = kc[m + 1];
+                                const double d0 = gf.weights[kc[0]](lv[0]) - gf.weights[km](lv[0]);
+                                rhs3(m)         = -d0;
+                                for (int c = 0; c < 3; ++c)
+                                {
+                                    const double dc =
+                                      gf.weights[kc[0]](lv[c + 1]) - gf.weights[km](lv[c + 1]);
+                                    mat3(m, c) = dc - d0;
+                                }
+                            }
+                            if (std::abs(mat3.determinant()) > 1e-14)
+                            {
+                                const Eigen::Vector3d lam = mat3.inverse() * rhs3;
+                                const double l0           = 1.0 - lam.x() - lam.y() - lam.z();
+                                if (std::isfinite(l0) && lam.allFinite() && l0 >= 0.02 &&
+                                    lam.x() >= 0.02 && lam.y() >= 0.02 && lam.z() >= 0.02)
+                                {
+                                    const Eigen::Vector3d pc_vec =
+                                      l0 * detail::point_as_vector(st.tetrahedralization.vertices[conn[0]]) +
+                                      lam.x() * detail::point_as_vector(st.tetrahedralization.vertices[conn[1]]) +
+                                      lam.y() * detail::point_as_vector(st.tetrahedralization.vertices[conn[2]]) +
+                                      lam.z() * detail::point_as_vector(st.tetrahedralization.vertices[conn[3]]);
+                                    cand_p     = { pc_vec.x(), pc_vec.y(), pc_vec.z() };
+                                    has_cand_p = true;
+                                }
+                            }
+                        }
+                        else if (tet_face_steiners.size() == 2)
+                        {
+                            // Exact midpoint of the P1 triple-junction segment traversing 2 faces
+                            cand_p = detail::midpoint(
+                              st.tetrahedralization.vertices[tet_face_steiners[0]],
+                              st.tetrahedralization.vertices[tet_face_steiners[1]]);
+                            has_cand_p = true;
+                        }
+
+                        if (has_cand_p)
+                        {
+                            const double parent_v = std::abs(detail::tetrahedron_signed_volume(
+                              st.tetrahedralization.vertices[conn[0]],
+                              st.tetrahedralization.vertices[conn[1]],
+                              st.tetrahedralization.vertices[conn[2]],
+                              st.tetrahedralization.vertices[conn[3]]));
+                            bool sub_vols_ok      = (parent_v > 1e-22);
+                            for (const auto& st_tri : all_face_sub_tris)
+                            {
+                                const double sv = std::abs(detail::tetrahedron_signed_volume(
+                                  st.tetrahedralization.vertices[st_tri[0]],
+                                  st.tetrahedralization.vertices[st_tri[1]],
+                                  st.tetrahedralization.vertices[st_tri[2]],
+                                  cand_p));
+                                if (sv <= 1e-22)
+                                {
+                                    sub_vols_ok = false;
+                                    break;
+                                }
+                            }
+                            if (sub_vols_ok)
+                            {
+                                p_center = cand_p;
+                            }
+                        }
+                    }
+
                     tet_steiner_vid = static_cast<Index>(st.tetrahedralization.vertices.size());
                     st.tetrahedralization.vertices.push_back(p_center);
 
-                    std::vector<std::array<Index, 3>> face_sub_tris;
-                    for (int f = 0; f < 4; ++f)
+                    for (const auto& st_tri : all_face_sub_tris)
                     {
-                        const auto& fc = detail::kTetFaces[f];
-                        face_sub_tris.clear();
-                        subdivide_face_canonically({ conn[fc[0]], conn[fc[1]], conn[fc[2]] },
-                                                   edge_cut_map,
-                                                   face_steiner_map,
-                                                   st.tetrahedralization.vertices,
-                                                   face_sub_tris);
-                        for (const auto& st_tri : face_sub_tris)
-                        {
-                            new_tetrahedra.push_back(make_positive_tet(
-                              st.tetrahedralization.vertices,
-                              st_tri[0],
-                              st_tri[1],
-                              st_tri[2],
-                              tet_steiner_vid));
-                        }
+                        new_tetrahedra.push_back(make_positive_tet(st.tetrahedralization.vertices,
+                                                                   st_tri[0],
+                                                                   st_tri[1],
+                                                                   st_tri[2],
+                                                                   tet_steiner_vid));
                     }
                 }
             }
@@ -2782,8 +3905,18 @@ void subdivide_and_partition_overlaps(const CombinedSurfaces& inconsistent_combi
         }
         else
         {
-            const auto& gf             = group_fields[g_idx];
-            const auto& allowed_global = st.object_region_info.region_to_objects_map[orig_r];
+            const auto& gf           = group_fields[g_idx];
+            std::vector<RegionID> allowed_global =
+              st.object_region_info.region_to_objects_map[orig_r];
+            for (int c = 0; c < 4; ++c)
+            {
+                const int lv     = static_cast<int>(gf.global_to_overlap_vertex_map.at(conn[c]));
+                const auto& lset = gf.vertex_label_sets[lv];
+                allowed_global.insert(allowed_global.end(), lset.begin(), lset.end());
+            }
+            std::sort(allowed_global.begin(), allowed_global.end());
+            allowed_global.erase(std::unique(allowed_global.begin(), allowed_global.end()),
+                                 allowed_global.end());
 
             const Eigen::Vector3d tet_p0 =
               detail::point_as_vector(st.tetrahedralization.vertices[conn[0]]);
@@ -3584,10 +4717,11 @@ void smooth_medial_surfaces(const ConsistentSurfaces& consistent_surfaces,
     }
 
     // Classify vertices:
-    // 0 = locked, 1 = interior medial sheet (2D), 2 = interior multi-medial junction curve (1D),
+    // 0 = locked, 1 = interior medial sheet (2D),
+    // 2 = interior multi-medial junction curve (1D) or 0D interior multi-junction vertex,
     // 3 = strictly interior 3D volume vertex near medial sheet.
     std::vector<uint8_t> vert_mode(n_verts, 0);
-    std::vector<std::array<Index, 2>> junc_curve_nbrs(n_verts, { NOT_SET_Index, NOT_SET_Index });
+    std::vector<std::vector<Index>> junc_star_nbrs(n_verts);
     std::vector<Index> medial_and_junc_verts;
     std::vector<bool> on_medial_closure(n_verts, false);
 
@@ -3612,22 +4746,30 @@ void smooth_medial_surfaces(const ConsistentSurfaces& consistent_surfaces,
                 medial_and_junc_verts.push_back(static_cast<Index>(v));
             }
         }
-        else if (vert_seam_edges[v].size() == 2 && !vert_medial_bids[v].empty())
+        else if (vert_seam_edges[v].size() >= 2 && !vert_medial_bids[v].empty())
         {
-            const Index e0  = vert_seam_edges[v][0];
-            const Index e1  = vert_seam_edges[v][1];
-            const SeamID s0 = st.seams_info.edge_id_to_seam_id_map[e0];
-            const SeamID s1 = st.seams_info.edge_id_to_seam_id_map[e1];
-            if (s0 != NOT_SET_SeamID && s0 == s1)
+            bool all_valid_seams = true;
+            std::vector<Index> jn;
+            jn.reserve(vert_seam_edges[v].size());
+            for (const Index eid : vert_seam_edges[v])
             {
-                const Index n0 = (tet_mesh.edges[e0][0] == v) ? tet_mesh.edges[e0][1]
-                                                              : tet_mesh.edges[e0][0];
-                const Index n1 = (tet_mesh.edges[e1][0] == v) ? tet_mesh.edges[e1][1]
-                                                              : tet_mesh.edges[e1][0];
-                if (n0 != n1)
+                if (st.seams_info.edge_id_to_seam_id_map[eid] == NOT_SET_SeamID)
                 {
-                    vert_mode[v]       = 2;
-                    junc_curve_nbrs[v] = { n0, n1 };
+                    all_valid_seams = false;
+                    break;
+                }
+                const Index nb = (tet_mesh.edges[eid][0] == v) ? tet_mesh.edges[eid][1]
+                                                               : tet_mesh.edges[eid][0];
+                jn.push_back(nb);
+            }
+            if (all_valid_seams)
+            {
+                std::sort(jn.begin(), jn.end());
+                jn.erase(std::unique(jn.begin(), jn.end()), jn.end());
+                if (jn.size() >= 2)
+                {
+                    vert_mode[v]      = 2;
+                    junc_star_nbrs[v] = std::move(jn);
                     medial_and_junc_verts.push_back(static_cast<Index>(v));
                 }
             }
@@ -3743,17 +4885,31 @@ void smooth_medial_surfaces(const ConsistentSurfaces& consistent_surfaces,
             return;
         }
 
-        double curr_min_vol = std::numeric_limits<double>::max();
-        for (const Index ti : vert_inc_tets[v])
+        const std::size_t n_inc = vert_inc_tets[v].size();
+        if (n_inc == 0)
         {
-            const auto& tc = tet_mesh.tetrahedra[ti];
-            curr_min_vol   = std::min(curr_min_vol,
-                                    detail::tetrahedron_signed_volume(tet_mesh.vertices[tc[0]],
-                                                                      tet_mesh.vertices[tc[1]],
-                                                                      tet_mesh.vertices[tc[2]],
-                                                                      tet_mesh.vertices[tc[3]]));
+            return;
         }
-        if (curr_min_vol <= 1e-24)
+        std::vector<double> curr_vol(n_inc, 0.0);
+        bool any_positive = false;
+        for (std::size_t k = 0; k < n_inc; ++k)
+        {
+            const auto& tc = tet_mesh.tetrahedra[vert_inc_tets[v][k]];
+            const double cv = detail::tetrahedron_signed_volume(tet_mesh.vertices[tc[0]],
+                                                                tet_mesh.vertices[tc[1]],
+                                                                tet_mesh.vertices[tc[2]],
+                                                                tet_mesh.vertices[tc[3]]);
+            if (cv < -1e-22)
+            {
+                return;
+            }
+            if (cv > 1e-22)
+            {
+                any_positive = true;
+            }
+            curr_vol[k] = cv;
+        }
+        if (!any_positive)
         {
             return;
         }
@@ -3763,16 +4919,25 @@ void smooth_medial_surfaces(const ConsistentSurfaces& consistent_surfaces,
             const double w       = step_weight * backoff;
             tet_mesh.vertices[v] = { old_p[0] + w * dx, old_p[1] + w * dy, old_p[2] + w * dz };
             bool ok              = true;
-            for (const Index ti : vert_inc_tets[v])
+            for (std::size_t k = 0; k < n_inc; ++k)
             {
+                const Index ti  = vert_inc_tets[v][k];
                 const auto& tc  = tet_mesh.tetrahedra[ti];
                 const double nv = detail::tetrahedron_signed_volume(tet_mesh.vertices[tc[0]],
                                                                     tet_mesh.vertices[tc[1]],
                                                                     tet_mesh.vertices[tc[2]],
                                                                     tet_mesh.vertices[tc[3]]);
-                const double floor_v =
-                  std::min(0.20 * orig_tet_vol[ti], 0.80 * curr_min_vol);
-                if (nv < floor_v || nv <= 1e-24)
+                if (curr_vol[k] > 1e-22)
+                {
+                    const double floor_v =
+                      std::min(0.20 * orig_tet_vol[ti], 0.80 * curr_vol[k]);
+                    if (nv < floor_v || nv <= 1e-24)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                else if (nv < curr_vol[k] || nv < -1e-24)
                 {
                     ok = false;
                     break;
@@ -3839,9 +5004,16 @@ void smooth_medial_surfaces(const ConsistentSurfaces& consistent_surfaces,
                 }
                 else
                 {
-                    const auto& jn   = junc_curve_nbrs[v];
-                    lap_targets[idx] = detail::midpoint(tet_mesh.vertices[jn[0]],
-                                                        tet_mesh.vertices[jn[1]]);
+                    const auto& jn = junc_star_nbrs[v];
+                    Point3 avg     = { 0.0, 0.0, 0.0 };
+                    for (const Index u : jn)
+                    {
+                        avg[0] += tet_mesh.vertices[u][0];
+                        avg[1] += tet_mesh.vertices[u][1];
+                        avg[2] += tet_mesh.vertices[u][2];
+                    }
+                    const double inv = 1.0 / static_cast<double>(jn.size());
+                    lap_targets[idx] = { avg[0] * inv, avg[1] * inv, avg[2] * inv };
                 }
             }
 
@@ -4357,24 +5529,79 @@ void polish_recovered_medial_surfaces(const ConsistentSurfaces& consistent_surfa
         const std::size_t nv = surf.vertices.size();
         const std::size_t nt = surf.triangles.size();
 
+        std::vector<bool> touches_non_medial(nv, false);
+        for (std::size_t ti = 0; ti < nt; ++ti)
+        {
+            const Marker m = surf.tri_to_marker_map[ti];
+            if (m >= is_medial_marker.size() || !is_medial_marker[m])
+            {
+                const auto& tc            = surf.triangles[ti];
+                touches_non_medial[tc[0]] = true;
+                touches_non_medial[tc[1]] = true;
+                touches_non_medial[tc[2]] = true;
+            }
+        }
+
         std::vector<bool> is_locked(nv, false);
+        std::vector<std::vector<Index>> junc_nbrs(nv);
         for (std::size_t eid = 0; eid < surf.edges.size(); ++eid)
         {
             const auto& inc     = surf.edge_to_tris_map[eid];
+            const Index ea      = surf.edges[eid][0];
+            const Index eb      = surf.edges[eid][1];
             bool interior_to_mm = false;
-            if (inc.size() == 2)
+            bool all_inc_medial = (inc.size() >= 2);
+            for (const auto& tp : inc)
             {
-                const Marker m0 = surf.tri_to_marker_map[inc[0].first];
-                const Marker m1 = surf.tri_to_marker_map[inc[1].first];
-                if (m0 == m1 && m0 < is_medial_marker.size() && is_medial_marker[m0])
+                const Marker m = surf.tri_to_marker_map[tp.first];
+                if (m >= is_medial_marker.size() || !is_medial_marker[m])
                 {
-                    interior_to_mm = true;
+                    all_inc_medial = false;
+                    break;
                 }
+            }
+            if (all_inc_medial && inc.size() == 2 &&
+                surf.tri_to_marker_map[inc[0].first] == surf.tri_to_marker_map[inc[1].first])
+            {
+                interior_to_mm = true;
             }
             if (!interior_to_mm)
             {
-                is_locked[surf.edges[eid][0]] = true;
-                is_locked[surf.edges[eid][1]] = true;
+                is_locked[ea] = true;
+                is_locked[eb] = true;
+                if (all_inc_medial)
+                {
+                    junc_nbrs[ea].push_back(eb);
+                    junc_nbrs[eb].push_back(ea);
+                }
+                else
+                {
+                    touches_non_medial[ea] = true;
+                    touches_non_medial[eb] = true;
+                }
+            }
+        }
+
+        std::vector<uint8_t> polish_mode(nv, 0); // 1 = 2D medial sheet, 2 = 1D medial junction curve
+        for (std::size_t v = 0; v < nv; ++v)
+        {
+            if (touches_non_medial[v])
+            {
+                continue;
+            }
+            if (!is_locked[v])
+            {
+                polish_mode[v] = 1;
+            }
+            else
+            {
+                auto& jn = junc_nbrs[v];
+                std::sort(jn.begin(), jn.end());
+                jn.erase(std::unique(jn.begin(), jn.end()), jn.end());
+                if (jn.size() >= 2)
+                {
+                    polish_mode[v] = 2;
+                }
             }
         }
 
@@ -4391,17 +5618,21 @@ void polish_recovered_medial_surfaces(const ConsistentSurfaces& consistent_surfa
             const auto& tc = surf.triangles[ti];
             for (int c = 0; c < 3; ++c)
             {
-                if (!is_locked[tc[c]])
+                const Index v = tc[c];
+                if (polish_mode[v] != 0)
                 {
-                    v_tris[tc[c]].push_back(static_cast<Index>(ti));
-                    v_nbrs[tc[c]].push_back(tc[(c + 1) % 3]);
-                    v_nbrs[tc[c]].push_back(tc[(c + 2) % 3]);
+                    v_tris[v].push_back(static_cast<Index>(ti));
+                    if (polish_mode[v] == 1)
+                    {
+                        v_nbrs[v].push_back(tc[(c + 1) % 3]);
+                        v_nbrs[v].push_back(tc[(c + 2) % 3]);
+                    }
                 }
             }
         }
         for (std::size_t v = 0; v < nv; ++v)
         {
-            if (!is_locked[v] && !v_nbrs[v].empty())
+            if (polish_mode[v] == 1 && !v_nbrs[v].empty())
             {
                 auto& nb = v_nbrs[v];
                 std::sort(nb.begin(), nb.end());
@@ -4410,6 +5641,11 @@ void polish_recovered_medial_surfaces(const ConsistentSurfaces& consistent_surfa
                 {
                     free_med_verts.push_back(static_cast<Index>(v));
                 }
+            }
+            else if (polish_mode[v] == 2 && !v_tris[v].empty())
+            {
+                v_nbrs[v] = junc_nbrs[v];
+                free_med_verts.push_back(static_cast<Index>(v));
             }
         }
         if (free_med_verts.empty())
@@ -4559,7 +5795,7 @@ void remove_interpenetrations(const CombinedSurfaces& inconsistent_combined_surf
     GlobalOptions::get().log_info(" - Initial # of overlap regions: " +
                                   std::to_string(st.object_region_info.regions_of_overlap.size()));
 
-    refine_overlap_interiors(st);
+    const OverlapRefinementContext refine_ctx = refine_overlap_interiors(st);
 
     const auto overlap_groups = find_overlap_region_groups(
       st.region_boundaries_info,
@@ -4572,7 +5808,7 @@ void remove_interpenetrations(const CombinedSurfaces& inconsistent_combined_surf
     group_fields.reserve(overlap_groups.size());
     for (const auto& overlap_group : overlap_groups)
     {
-        group_fields.push_back(compute_group_harmonic_field(st, overlap_group));
+        group_fields.push_back(compute_group_harmonic_field(st, overlap_group, refine_ctx));
     }
 
     subdivide_and_partition_overlaps(inconsistent_combined_surfaces,
