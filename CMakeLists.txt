@@ -17,6 +17,9 @@ endif()
 option(MESHARRANGE_BUILD_TESTS
        "Build MeshArrange unit and regression tests"
        ${_mesh_arrange_is_top_level})
+option(MESHARRANGE_BUILD_EXAMPLES
+       "Build MeshArrange demonstration executables in examples/"
+       OFF)
 option(MESHARRANGE_INSTALL
        "Generate install and CMake package export rules for MeshArrange"
        ${_mesh_arrange_is_top_level})
@@ -214,6 +217,13 @@ if(MESHARRANGE_BUILD_TESTS)
         mesh_arrange_add_test(test_consistent_and_features tests/test_consistent_and_features.cpp)
         mesh_arrange_add_test(test_interpenetration_cases tests/test_interpenetration_cases.cpp)
     endif()
+endif()
+
+# ==============================================================================
+# Examples / Gallery Demos
+# ==============================================================================
+if(MESHARRANGE_BUILD_EXAMPLES AND MESHARRANGE_WITH_TETGEN)
+    add_subdirectory(examples)
 endif()
 
 # ==============================================================================

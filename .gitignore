@@ -15,5 +15,10 @@ compile_commands.json
 *.exe
 *.vtk
 *.vtu
+!docs/
+!docs/meshes/
+!docs/meshes/*.vtu
 *.msh
+__pycache__/
+*.pyc
 .DS_Store
