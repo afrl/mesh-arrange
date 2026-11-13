@@ -60,17 +60,19 @@ When three or more equal-priority solids overlap at a common junction (`K >= 3`)
 
 ## Project Structure
 
-- `include/mesh_arrange/` — Public pure-STL C++17 headers:
+- `include/mesh_arrange/` — Public pure-STL C++17 headers (C++14-compatible for consumer translation units):
   - `MeshArrange.h` — High-level `arrange_surfaces(...)` API, `ArrangeOptions`, `ArrangeResult`, and B-Rep structs (`BRepVertex`, `BRepCurve`, `BRepFace`, `BRepVolume`).
-  - `GmshModelBuilder.h` — Header-only `populate_gmsh_discrete_model(...)` adapter for Gmsh `GModel` discrete entities.
+  - `GmshSdkAdapter.h` — Header-only public Gmsh SDK adapter (`mesh_arrange::gmsh_sdk::arrange_surfaces`, `plc_tetrahedralizer`, `populate_arranged_model`) linking directly against `libgmsh` (`gmsh.h`) with **zero TetGen dependency**.
+  - `GmshModelBuilder.h` — Header-only `populate_gmsh_discrete_model(...)` adapter for internal Gmsh `GModel` discrete entities.
   - `PlcBackend.h` — Pluggable `PlcTetrahedralizerFn` interface for custom coarse 3D PLC tetrahedralizers.
   - Modular pipeline headers (`CombinedSurfaces.h`, `ConsistentSurfaces.h`, `FeatureIdentification.h`, `InterpenetrationRemoval.h`, `Refinement.h`, `QualityTriangulation.h`, `Triangulation.h`, `Tetrahedralization.h`, `Seams.h`, `SplitEdges.h`, `Optimize.h`).
+- `gmsh_upstream/` — Drop-in upstream Gmsh contribution bundle implementing **Option C**: `src/mesh/meshArrange.{h,cpp}`, `src/plugin/ArrangeSurfaces.{h,cpp}`, `api/gen.py` + `api/gmsh.cpp` bindings (`gmsh::model::mesh::arrangeSurfaces`), `CMakeLists_gmsh.cmake`, and `demos/arrange_surfaces.py`.
 - `src/` — Library implementation and private geometry helpers.
 - `examples/` — Self-contained C++17 capability demonstrations (writing standard `.vtu` meshes directly) and headless gallery renderer (`render_gallery.py`).
 - `docs/images/` — Rendered demonstration figures displayed in this README.
 - `docs/meshes/` — Downloadable `.vtu` (VTK XML UnstructuredGrid) input, B-Rep, and 3D tetrahedral volume meshes for all five demonstrations.
-- `third_party/` — Vendored private header subset of `libigl` and optional namespaced TetGen 1.6.
-- `tests/` — CTest unit and regression suites (`test_topology_and_seams`, `test_consistent_and_features`, `test_interpenetration_cases`, `test_custom_plc_and_gmsh_builder`).
+- `third_party/` — Vendored private header subset of `libigl` (`remesh_self_intersections`) and optional namespaced TetGen 1.6.
+- `tests/` — CTest unit, regression, and live Gmsh SDK integration suites (`test_topology_and_seams`, `test_consistent_and_features`, `test_interpenetration_cases`, `test_custom_plc_and_gmsh_builder`, `test_gmsh_sdk_integration`).
 - CMake package & target: `MeshArrange` / `MeshArrange::mesh_arrange`.
 
 ---
@@ -132,14 +134,17 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-To build without the bundled TetGen backend (custom `PlcTetrahedralizerFn` only):
+To build without the bundled TetGen backend and verify end-to-end 3D meshing against a Gmsh SDK installation (`-DMESHARRANGE_GMSH_ROOT=/path/to/gmsh`):
 
 ```bash
 cmake -S . -B build-no-tetgen -DCMAKE_BUILD_TYPE=Release \
-  -DMESHARRANGE_WITH_TETGEN=OFF -DMESHARRANGE_BUILD_TESTS=ON
+  -DMESHARRANGE_WITH_TETGEN=OFF -DMESHARRANGE_BUILD_TESTS=ON \
+  -DMESHARRANGE_GMSH_ROOT=/path/to/gmsh
 cmake --build build-no-tetgen -j
 ctest --test-dir build-no-tetgen --output-on-failure
 ```
+
+For contributing `mesh-arrange` directly into an upstream Gmsh source tree (`gmsh::model::mesh::arrangeSurfaces` + `Plugin(ArrangeSurfaces)`), see [`gmsh_upstream/README.md`](gmsh_upstream/README.md).
 
 See [`examples/README.md`](examples/README.md) for instructions on running the individual demo executables and regenerating the figures in `docs/images/`.
 

@@ -127,7 +127,7 @@ bool can_safely_flip_edge(const Triangulation& t,
 
     const Eigen::Vector3d u1_before = n1_before / area1_b;
     const Eigen::Vector3d u2_before = n2_before / area2_b;
-    if (u1_before.dot(u2_before) < 0.5)
+    if (u1_before.dot(u2_before) < 0.995)
     {
         return false;
     }
@@ -152,10 +152,103 @@ bool can_safely_flip_edge(const Triangulation& t,
     const Eigen::Vector3d u2_after   = n2_after / area2_a;
     const Eigen::Vector3d avg_before = (u1_before + u2_before).normalized();
 
-    if (u1_after.dot(avg_before) <= 0.5 || u2_after.dot(avg_before) <= 0.5 ||
-        u1_after.dot(u2_after) < 0.5)
+    if (u1_after.dot(avg_before) <= 0.995 || u2_after.dot(avg_before) <= 0.995 ||
+        u1_after.dot(u2_after) < 0.995)
     {
         return false;
+    }
+
+    // Ensure neither new_t1 nor new_t2 folds onto any neighbor triangle across the 4 quad edges
+    auto half_plane_dir = [&](Index ea, Index eb, Index vc, Eigen::Vector3d& out_dir) -> bool
+    {
+        const Eigen::Vector3d pa  = detail::point_as_vector(t.vertices[ea]);
+        const Eigen::Vector3d ab  = detail::point_as_vector(t.vertices[eb]) - pa;
+        const double ab_len2      = ab.squaredNorm();
+        if (ab_len2 <= 1e-28)
+        {
+            return false;
+        }
+        const Eigen::Vector3d ac   = detail::point_as_vector(t.vertices[vc]) - pa;
+        const Eigen::Vector3d perp = ac - (ac.dot(ab) / ab_len2) * ab;
+        const double perp_len      = perp.norm();
+        if (perp_len <= 1e-14)
+        {
+            return false;
+        }
+        out_dir = perp / perp_len;
+        return true;
+    };
+
+    const Index quad_tris[2] = { t1_id, t2_id };
+    for (int qt = 0; qt < 2; ++qt)
+    {
+        for (int le = 0; le < 3; ++le)
+        {
+            const Index outer_eid = t.tri_to_edges_map[quad_tris[qt]][le];
+            if (outer_eid == edge_to_flip_id)
+            {
+                continue;
+            }
+            const Index ea = t.edges[outer_eid][0];
+            const Index eb = t.edges[outer_eid][1];
+            auto third_vert = [&](const std::array<Index, 3>& tri) -> Index
+            {
+                bool has_a = false;
+                bool has_b = false;
+                Index opp  = NOT_SET_Index;
+                for (int c = 0; c < 3; ++c)
+                {
+                    if (tri[c] == ea)
+                    {
+                        has_a = true;
+                    }
+                    else if (tri[c] == eb)
+                    {
+                        has_b = true;
+                    }
+                    else
+                    {
+                        opp = tri[c];
+                    }
+                }
+                return (has_a && has_b) ? opp : NOT_SET_Index;
+            };
+
+            Index vc = third_vert(new_t1);
+            if (vc == NOT_SET_Index)
+            {
+                vc = third_vert(new_t2);
+            }
+            if (vc == NOT_SET_Index)
+            {
+                return false;
+            }
+
+            Eigen::Vector3d hc;
+            if (!half_plane_dir(ea, eb, vc, hc))
+            {
+                return false;
+            }
+
+            for (const auto& nb_entry : t.edge_to_tris_map[outer_eid])
+            {
+                const Index nb_tid = nb_entry.first;
+                if (nb_tid == t1_id || nb_tid == t2_id)
+                {
+                    continue;
+                }
+                const Index vd = third_vert(t.triangles[nb_tid]);
+                if (vd == NOT_SET_Index)
+                {
+                    continue;
+                }
+                Eigen::Vector3d hd;
+                if (!half_plane_dir(ea, eb, vd, hd) || hc.dot(hd) >= 0.999)
+                {
+                    return false;
+                }
+            }
+        }
     }
 
     return true;
@@ -272,8 +365,7 @@ void optimize_tangential_smoothing(Triangulation& t,
       *std::max_element(t.tri_to_marker_map.begin(), t.tri_to_marker_map.end()) + 1;
     t.n_markers = std::max(t.n_markers, n_facets);
 
-    const auto vert_to_tri_map    = build_vert_to_tri_map(t);
-    const auto original_positions = t.vertices;
+    const auto vert_to_tri_map = build_vert_to_tri_map(t);
 
     std::vector<std::vector<Index>> facet_id_to_vert_id_map(n_facets);
     for (Index v_id = 0; v_id < static_cast<Index>(t.vertices.size()); ++v_id)
@@ -342,7 +434,57 @@ void optimize_tangential_smoothing(Triangulation& t,
                 {
                     is_vert_on_corner[n_id] = true;
                 }
+                else
+                {
+                    const Eigen::Vector3d pc = detail::point_as_vector(t.vertices[n_id]);
+                    const Eigen::Vector3d p0 =
+                      detail::point_as_vector(t.vertices[vert_to_neighbors_on_seam[n_id][0].node_id]);
+                    const Eigen::Vector3d p1 =
+                      detail::point_as_vector(t.vertices[vert_to_neighbors_on_seam[n_id][1].node_id]);
+                    const Eigen::Vector3d d0 = pc - p0;
+                    const Eigen::Vector3d d1 = p1 - pc;
+                    const double l0          = d0.norm();
+                    const double l1          = d1.norm();
+                    if (l0 <= 1e-14 || l1 <= 1e-14 || (d0 / l0).dot(d1 / l1) < 0.999)
+                    {
+                        is_vert_on_corner[n_id] = true;
+                    }
+                }
             }
+        }
+    }
+
+    // Preserve sharp intra-patch geometric feature creases (dihedral > ~30 deg, e.g. 90-deg box edges
+    // sharing a single RegionBoundaryID) so smoothing does not round or collapse CAD edges.
+    for (std::size_t eid = 0; eid < t.edges.size(); ++eid)
+    {
+        const auto& etris = t.edge_to_tris_map[eid];
+        if (etris.size() != 2)
+        {
+            continue;
+        }
+        const Index t0 = etris[0].first;
+        const Index t1 = etris[1].first;
+        if (t.tri_to_marker_map[t0] != t.tri_to_marker_map[t1])
+        {
+            continue;
+        }
+        const auto& c0           = t.triangles[t0];
+        const auto& c1           = t.triangles[t1];
+        const Eigen::Vector3d n0 = (detail::point_as_vector(t.vertices[c0[1]]) -
+                                    detail::point_as_vector(t.vertices[c0[0]]))
+                                     .cross(detail::point_as_vector(t.vertices[c0[2]]) -
+                                            detail::point_as_vector(t.vertices[c0[0]]));
+        const Eigen::Vector3d n1 = (detail::point_as_vector(t.vertices[c1[1]]) -
+                                    detail::point_as_vector(t.vertices[c1[0]]))
+                                     .cross(detail::point_as_vector(t.vertices[c1[2]]) -
+                                            detail::point_as_vector(t.vertices[c1[0]]));
+        const double l0 = n0.norm();
+        const double l1 = n1.norm();
+        if (l0 > 1e-14 && l1 > 1e-14 && (n0 / l0).dot(n1 / l1) < 0.866)
+        {
+            is_vert_on_corner[t.edges[eid][0]] = true;
+            is_vert_on_corner[t.edges[eid][1]] = true;
         }
     }
 
@@ -445,19 +587,136 @@ void optimize_tangential_smoothing(Triangulation& t,
             }
         }
 
-        for (std::size_t v_id = 0; v_id < t.vertices.size(); ++v_id)
+        auto move_preserves_ring = [&](const std::size_t v_id, const Point3& cand) -> bool
         {
-            if (!is_vert_on_corner[v_id])
+            const auto ring_tris = vert_to_tri_map.get_indices(static_cast<Index>(v_id));
+
+            for (const Index tri_id : ring_tris)
             {
-                t.vertices[v_id] = detail::add_points(t.vertices[v_id], updated_coords[v_id]);
+                const Marker patch_id    = t.tri_to_marker_map[tri_id];
+                const auto& conn         = t.triangles[tri_id];
+                const Eigen::Vector3d a0 = detail::point_as_vector(t.vertices[conn[0]]);
+                const Eigen::Vector3d b0 = detail::point_as_vector(t.vertices[conn[1]]);
+                const Eigen::Vector3d c0 = detail::point_as_vector(t.vertices[conn[2]]);
+                Eigen::Vector3d n_ref    = (b0 - a0).cross(c0 - a0);
+                double ref_len           = n_ref.norm();
+                if (ref_len <= 1e-14)
+                {
+                    // Degenerate sliver: infer outward reference normal from same-patch 1-ring
+                    n_ref.setZero();
+                    for (const Index nb_tri : ring_tris)
+                    {
+                        if (t.tri_to_marker_map[nb_tri] == patch_id)
+                        {
+                            const auto& nc = t.triangles[nb_tri];
+                            n_ref += (detail::point_as_vector(t.vertices[nc[1]]) -
+                                      detail::point_as_vector(t.vertices[nc[0]]))
+                                       .cross(detail::point_as_vector(t.vertices[nc[2]]) -
+                                              detail::point_as_vector(t.vertices[nc[0]]));
+                        }
+                    }
+                    ref_len = n_ref.norm();
+                    if (ref_len <= 1e-16)
+                    {
+                        return false;
+                    }
+                }
+
+                const Eigen::Vector3d a1 =
+                  detail::point_as_vector(conn[0] == v_id ? cand : t.vertices[conn[0]]);
+                const Eigen::Vector3d b1 =
+                  detail::point_as_vector(conn[1] == v_id ? cand : t.vertices[conn[1]]);
+                const Eigen::Vector3d c1 =
+                  detail::point_as_vector(conn[2] == v_id ? cand : t.vertices[conn[2]]);
+                const Eigen::Vector3d n1 = (b1 - a1).cross(c1 - a1);
+                const double len1        = n1.norm();
+                if (len1 <= 1e-14 || n_ref.dot(n1) <= 0.25 * ref_len * len1)
+                {
+                    return false;
+                }
             }
-        }
+
+            auto pos_after = [&](Index vid) -> Eigen::Vector3d
+            {
+                return detail::point_as_vector(vid == v_id ? cand : t.vertices[vid]);
+            };
+            auto half_plane_after = [&](Index ea, Index eb, Index vc, Eigen::Vector3d& out_dir) -> bool
+            {
+                const Eigen::Vector3d pa = pos_after(ea);
+                const Eigen::Vector3d ab = pos_after(eb) - pa;
+                const double ab_len2     = ab.squaredNorm();
+                if (ab_len2 <= 1e-28)
+                {
+                    return false;
+                }
+                const Eigen::Vector3d ac   = pos_after(vc) - pa;
+                const Eigen::Vector3d perp = ac - (ac.dot(ab) / ab_len2) * ab;
+                const double perp_len      = perp.norm();
+                if (perp_len <= 1e-14)
+                {
+                    return false;
+                }
+                out_dir = perp / perp_len;
+                return true;
+            };
+
+            // Never collapse any edge-adjacent triangle pair (inside or across the 1-ring boundary)
+            // onto the same half-plane (0 dihedral angle)
+            for (const Index ti : ring_tris)
+            {
+                const auto& ci = t.triangles[ti];
+                for (int le = 0; le < 3; ++le)
+                {
+                    const Index eid = t.tri_to_edges_map[ti][le];
+                    const Index ea  = t.edges[eid][0];
+                    const Index eb  = t.edges[eid][1];
+                    Index vc        = NOT_SET_Index;
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        if (ci[c] != ea && ci[c] != eb)
+                        {
+                            vc = ci[c];
+                        }
+                    }
+                    Eigen::Vector3d hc;
+                    if (vc == NOT_SET_Index || !half_plane_after(ea, eb, vc, hc))
+                    {
+                        return false;
+                    }
+                    for (const auto& nb_entry : t.edge_to_tris_map[eid])
+                    {
+                        const Index tj = nb_entry.first;
+                        if (tj == ti)
+                        {
+                            continue;
+                        }
+                        const auto& cj = t.triangles[tj];
+                        Index vd       = NOT_SET_Index;
+                        for (int c = 0; c < 3; ++c)
+                        {
+                            if (cj[c] != ea && cj[c] != eb)
+                            {
+                                vd = cj[c];
+                            }
+                        }
+                        Eigen::Vector3d hd;
+                        if (vd == NOT_SET_Index || !half_plane_after(ea, eb, vd, hd) ||
+                            hc.dot(hd) >= 0.999)
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        };
 
         for (std::size_t v_id = 0; v_id < t.vertices.size(); ++v_id)
         {
             if (!is_vert_on_corner[v_id] && !is_vert_on_seam[v_id])
             {
-                Eigen::Vector3d new_point = detail::point_as_vector(t.vertices[v_id]);
+                const Point3 shifted      = detail::add_points(t.vertices[v_id], updated_coords[v_id]);
+                Eigen::Vector3d new_point = detail::point_as_vector(shifted);
                 for (const Marker facet_id : vert_id_to_input_facet_ids_map[v_id])
                 {
                     if (facet_id < igl_facets.size() && igl_facets[facet_id].triangles.rows() > 0)
@@ -465,76 +724,54 @@ void optimize_tangential_smoothing(Triangulation& t,
                         new_point = detail::igl_closest_point(igl_facets[facet_id], new_point);
                     }
                 }
-                t.vertices[v_id] = detail::to_point(new_point);
+                const Point3 cand = detail::to_point(new_point);
+                if (move_preserves_ring(v_id, cand))
+                {
+                    t.vertices[v_id] = cand;
+                }
             }
         }
 
         if (allow_smoothing_on_seams)
         {
-            const std::size_t max_seam_steps = seams.edges_on_seams.size() + 1;
             for (Marker seam_id = 0; seam_id < seams.n_seams; ++seam_id)
             {
                 for (const Index v_id : seam_id_to_vert_id_map[seam_id])
                 {
-                    if (!is_vert_on_corner[v_id])
+                    if (!is_vert_on_corner[v_id] && vert_to_neighbors_on_seam[v_id].size() == 2)
                     {
-                        const Point3 p        = t.vertices[v_id];
-                        const auto& neighbor1 = vert_to_neighbors_on_seam[v_id][0];
-                        const auto result1    = detail::closest_point_on_line_segment(
-                          p,
-                          original_positions[t.edges[neighbor1.edge_id][0]],
-                          original_positions[t.edges[neighbor1.edge_id][1]]);
+                        const Eigen::Vector3d p_cur = detail::point_as_vector(t.vertices[v_id]);
+                        const Eigen::Vector3d p_target =
+                          p_cur + 0.5 * detail::point_as_vector(updated_coords[v_id]);
+                        const Eigen::Vector3d p_n1 =
+                          detail::point_as_vector(t.vertices[vert_to_neighbors_on_seam[v_id][0].node_id]);
+                        const Eigen::Vector3d p_n2 =
+                          detail::point_as_vector(t.vertices[vert_to_neighbors_on_seam[v_id][1].node_id]);
 
-                        const auto& neighbor2 = vert_to_neighbors_on_seam[v_id][1];
-                        const auto result2    = detail::closest_point_on_line_segment(
-                          p,
-                          original_positions[t.edges[neighbor2.edge_id][0]],
-                          original_positions[t.edges[neighbor2.edge_id][1]]);
-
-                        Index curr_n_id    = v_id;
-                        auto curr_neighbor = neighbor1;
-                        auto curr_result   = result1;
-                        if (result2.distance < result1.distance)
+                        // Project strictly onto the interior [0.15, 0.85] of one of the two current
+                        // incident seam segments so adjacent seam vertices can never cross or invert.
+                        auto clamped_seg_proj = [&](const Eigen::Vector3d& seg_end) -> Eigen::Vector3d
                         {
-                            curr_neighbor = neighbor2;
-                            curr_result   = result2;
-                        }
+                            const Eigen::Vector3d d  = seg_end - p_cur;
+                            const double len2        = d.squaredNorm();
+                            if (len2 <= 1e-28)
+                            {
+                                return p_cur;
+                            }
+                            double s = (p_target - p_cur).dot(d) / len2;
+                            s        = std::max(0.0, std::min(0.45, s));
+                            return p_cur + s * d;
+                        };
 
-                        std::size_t steps = 0;
-                        while (steps++ < max_seam_steps)
+                        const Eigen::Vector3d c1 = clamped_seg_proj(p_n1);
+                        const Eigen::Vector3d c2 = clamped_seg_proj(p_n2);
+                        const Eigen::Vector3d best =
+                          ((c2 - p_target).squaredNorm() < (c1 - p_target).squaredNorm()) ? c2 : c1;
+                        const Point3 cand = detail::to_point(best);
+                        if (move_preserves_ring(v_id, cand))
                         {
-                            if (is_vert_on_corner[curr_neighbor.node_id])
-                            {
-                                break;
-                            }
-                            const auto& next_neighbors =
-                              vert_to_neighbors_on_seam[curr_neighbor.node_id];
-                            if (next_neighbors.size() != 2)
-                            {
-                                break;
-                            }
-
-                            auto next_neighbor = next_neighbors[0];
-                            if (next_neighbors[0].node_id == curr_n_id)
-                            {
-                                next_neighbor = next_neighbors[1];
-                            }
-                            const auto next_result = detail::closest_point_on_line_segment(
-                              p,
-                              original_positions[t.edges[next_neighbor.edge_id][0]],
-                              original_positions[t.edges[next_neighbor.edge_id][1]]);
-
-                            if (next_result.distance >= curr_result.distance)
-                            {
-                                break;
-                            }
-
-                            curr_n_id     = curr_neighbor.node_id;
-                            curr_neighbor = next_neighbor;
-                            curr_result   = next_result;
+                            t.vertices[v_id] = cand;
                         }
-
-                        t.vertices[v_id] = curr_result.closest_point;
                     }
                 }
             }
@@ -632,10 +869,24 @@ void optimize_edge_flips(Triangulation& t, const int n_passes)
                     continue;
                 }
                 const Index edge_id = orig_connected_edges[sorted_i];
+                if (t.edges[edge_id][0] != v_id && t.edges[edge_id][1] != v_id)
+                {
+                    continue;
+                }
+                if (t.edge_to_tris_map[edge_id].size() != 2 ||
+                    t.tri_to_marker_map[t.edge_to_tris_map[edge_id][0].first] !=
+                      t.tri_to_marker_map[t.edge_to_tris_map[edge_id][1].first])
+                {
+                    continue;
+                }
+                const Index live_t1 = t.edge_to_tris_map[edge_id][0].first;
+                const Index live_t2 = t.edge_to_tris_map[edge_id][1].first;
+                const Index ext0    = t.triangles[live_t1][find_external_vertex_position(t, live_t1, edge_id)];
+                const Index ext1    = t.triangles[live_t2][find_external_vertex_position(t, live_t2, edge_id)];
 
                 if (v_valence > 7 &&
-                    v_valence > vertex_valences[external_vertices[sorted_i][0]] + 1 &&
-                    v_valence > vertex_valences[external_vertices[sorted_i][1]] + 1 &&
+                    v_valence > vertex_valences[ext0] + 1 &&
+                    v_valence > vertex_valences[ext1] + 1 &&
                     can_safely_flip_edge(t, edge_id, node_to_edge_map))
                 {
                     const auto orig_edge = t.edges[edge_id];

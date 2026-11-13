@@ -741,19 +741,50 @@ void split_large_edges(const double max_edge_length, Triangulation& t, SeamInfo&
                                   std::to_string(max_edge_length));
     while (true)
     {
-        std::vector<Index> edges_to_split;
+        std::vector<std::pair<double, Index>> candidates;
         for (std::size_t edge_id = 0; edge_id < t.edges.size(); ++edge_id)
         {
             const auto& edge    = t.edges[edge_id];
             const double length = detail::distance(t.vertices[edge[0]], t.vertices[edge[1]]);
             if (length > max_edge_length)
             {
-                edges_to_split.push_back(static_cast<Index>(edge_id));
+                candidates.emplace_back(length, static_cast<Index>(edge_id));
             }
         }
-        if (edges_to_split.empty())
+        if (candidates.empty())
         {
             break;
+        }
+
+        std::sort(candidates.begin(),
+                  candidates.end(),
+                  [](const std::pair<double, Index>& a, const std::pair<double, Index>& b) {
+                      return a.first > b.first;
+                  });
+
+        std::vector<bool> tri_busy(t.triangles.size(), false);
+        std::vector<Index> edges_to_split;
+        edges_to_split.reserve(candidates.size());
+        for (std::size_t i = 0; i < candidates.size(); ++i)
+        {
+            const Index eid = candidates[i].second;
+            bool conflict   = false;
+            for (const auto& tp : t.edge_to_tris_map[eid])
+            {
+                if (tri_busy[tp.first])
+                {
+                    conflict = true;
+                    break;
+                }
+            }
+            if (!conflict)
+            {
+                edges_to_split.push_back(eid);
+                for (const auto& tp : t.edge_to_tris_map[eid])
+                {
+                    tri_busy[tp.first] = true;
+                }
+            }
         }
 
         const auto update_result = split_edges(edges_to_split, t);

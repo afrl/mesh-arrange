@@ -1,15 +1,104 @@
 #include "mesh_arrange/QualityTriangulation.h"
 
 #include "detail/IGLHelpers.h"
+#include "detail/MathHelpers.h"
+#include "igl/copyleft/cgal/remesh_self_intersections.h"
 #include "mesh_arrange/Optimize.h"
 #include "mesh_arrange/SplitEdges.h"
 
+#include <algorithm>
 #include <cassert>
 #include <set>
 #include <vector>
 
 namespace mesh_arrange
 {
+
+namespace
+{
+
+Eigen::MatrixXi detect_self_intersecting_pairs(const Triangulation& t)
+{
+    Eigen::MatrixXd V(static_cast<Eigen::Index>(t.vertices.size()), 3);
+    for (std::size_t i = 0; i < t.vertices.size(); ++i)
+    {
+        V(static_cast<Eigen::Index>(i), 0) = t.vertices[i][0];
+        V(static_cast<Eigen::Index>(i), 1) = t.vertices[i][1];
+        V(static_cast<Eigen::Index>(i), 2) = t.vertices[i][2];
+    }
+    Eigen::MatrixXi F(static_cast<Eigen::Index>(t.triangles.size()), 3);
+    for (std::size_t i = 0; i < t.triangles.size(); ++i)
+    {
+        F(static_cast<Eigen::Index>(i), 0) = static_cast<int>(t.triangles[i][0]);
+        F(static_cast<Eigen::Index>(i), 1) = static_cast<int>(t.triangles[i][1]);
+        F(static_cast<Eigen::Index>(i), 2) = static_cast<int>(t.triangles[i][2]);
+    }
+
+    igl::copyleft::cgal::RemeshSelfIntersectionsParam params;
+    params.detect_only = true;
+    params.first_only  = false;
+    params.stitch_all  = false;
+
+    Eigen::MatrixXd VV;
+    Eigen::MatrixXi FF;
+    Eigen::MatrixXi IF;
+    Eigen::VectorXi J;
+    Eigen::VectorXi IM;
+    igl::copyleft::cgal::remesh_self_intersections(V, F, params, VV, FF, IF, J, IM);
+    return IF;
+}
+
+void revert_intersecting_patches(Triangulation& t, const std::vector<Point3>& safe_vertices)
+{
+    assert(t.vertices.size() == safe_vertices.size());
+    for (int pass = 0; pass < 3; ++pass)
+    {
+        const Eigen::MatrixXi IF = detect_self_intersecting_pairs(t);
+        if (IF.rows() == 0)
+        {
+            return;
+        }
+        if (pass == 2)
+        {
+            t.vertices = safe_vertices;
+            return;
+        }
+        std::set<Marker> bad_patches;
+        for (Eigen::Index r = 0; r < IF.rows(); ++r)
+        {
+            for (int side = 0; side < 2; ++side)
+            {
+                const int fid = IF(r, side);
+                if (fid >= 0 && static_cast<std::size_t>(fid) < t.tri_to_marker_map.size())
+                {
+                    bad_patches.insert(t.tri_to_marker_map[static_cast<std::size_t>(fid)]);
+                }
+            }
+        }
+        for (std::size_t ti = 0; ti < t.triangles.size(); ++ti)
+        {
+            if (bad_patches.count(t.tri_to_marker_map[ti]) > 0)
+            {
+                const auto& tri    = t.triangles[ti];
+                t.vertices[tri[0]] = safe_vertices[tri[0]];
+                t.vertices[tri[1]] = safe_vertices[tri[1]];
+                t.vertices[tri[2]] = safe_vertices[tri[2]];
+            }
+        }
+    }
+}
+
+void run_safe_edge_flips(Triangulation& t, int n_iters)
+{
+    const Triangulation backup = t;
+    optimize_edge_flips(t, n_iters);
+    if (detect_self_intersecting_pairs(t).rows() > 0)
+    {
+        t = backup;
+    }
+}
+
+} // namespace
 
 RecoveredTriangulation recover_triangulation(SegmentedTetrahedralization& t)
 {
@@ -92,22 +181,41 @@ void optimize_recovered_triangulation(RecoveredTriangulation& rt)
         return;
     }
 
-    optimize_edge_flips(rt.t, 5);
+    run_safe_edge_flips(rt.t, 5);
 
-    const auto stats              = query_edge_length_stats(rt.t);
-    const double mean_edge_length = stats.mean;
+    const auto stats = query_edge_length_stats(rt.t);
+    double sum_len   = 0.0;
+    double sum_len2  = 0.0;
+    for (const auto& edge : rt.t.edges)
+    {
+        const double len = detail::distance(rt.t.vertices[edge[0]], rt.t.vertices[edge[1]]);
+        sum_len += len;
+        sum_len2 += len * len;
+    }
+    const double length_weighted_mean = (sum_len > 0.0) ? (sum_len2 / sum_len) : stats.mean;
+    const double target_split_length  = 1.25 * std::max(stats.mean, length_weighted_mean);
 
     auto seam_info = segment_seams(rt.t);
 
-    optimize_tangential_smoothing(rt.t, seam_info, 10, true);
+    {
+        const std::vector<Point3> safe_verts = rt.t.vertices;
+        optimize_tangential_smoothing(rt.t, seam_info, 8, false);
+        revert_intersecting_patches(rt.t, safe_verts);
+    }
 
-    split_large_edges(1.25 * mean_edge_length, rt.t, seam_info);
+    split_large_edges(target_split_length, rt.t, seam_info);
 
-    optimize_edge_flips(rt.t, 5);
+    run_safe_edge_flips(rt.t, 5);
 
+    seam_info = segment_seams(rt.t);
     split_constrained_edges(rt.t, seam_info);
 
-    optimize_tangential_smoothing(rt.t, seam_info, 10, true);
+    seam_info = segment_seams(rt.t);
+    {
+        const std::vector<Point3> safe_verts = rt.t.vertices;
+        optimize_tangential_smoothing(rt.t, seam_info, 8, false);
+        revert_intersecting_patches(rt.t, safe_verts);
+    }
 }
 
 Triangulation find_global_boundary(const RecoveredTriangulation& rt)

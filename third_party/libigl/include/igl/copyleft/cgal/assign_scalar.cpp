@@ -6,6 +6,10 @@
 // v. 2.0. If a copy of the MPL was not distributed with this file, You can
 // obtain one at http://mozilla.org/MPL/2.0/.
 #include "assign_scalar.h"
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
 
 template <>
 IGL_INLINE void igl::copyleft::cgal::assign_scalar(
@@ -13,29 +17,12 @@ IGL_INLINE void igl::copyleft::cgal::assign_scalar(
   const bool & slow_and_more_precise,
   double & lhs)
 {
-  if(slow_and_more_precise)
-  {
-    return assign_scalar(rhs,lhs);
-  }else
-  {
-    // While this is significantly faster (100x), this does not guarantee that
-    // two equivalent rationals produce the same double (e.g.,
-    // CGAL::to_double(⅓) ≠ CGAL::to_double(1-⅔))
-    // https://github.com/CGAL/cgal/discussions/6000 For remesh_intersections,
-    // `unique` is called _after_ rounding to floats, avoiding more expensive
-    // rational equality tests. To operate correctly, we need that a=b ⇒
-    // double(a)=double(b). Alternatively, we could require that
-    // remesh_intersections conduct its `unique` operation on rationals. This is
-    // even more expensive (4x) and most of the time probably overkill, though
-    // it is argueably more correct in terms of producing the correct topology
-    // (despite degeneracies that appear during rounding). On the other hand,
-    // this rounding-before-unique only occurs if the requested output is float,
-    // so its a question of combinatorial vs geometric degeneracies. Argueably,
-    // combinatorial degeneracies are more reliably detected.
-    //
-    //lhs = CGAL::to_double(rhs);
-    lhs = CGAL::to_double(rhs.exact());
-  }
+  // Always perform canonical IEEE-754 round-to-nearest-even via binary search
+  // on CGAL::to_interval(rhs.exact()) (typically 0-2 comparisons with GMP) so
+  // equal rationals from distinct intersection constructions always map to bit-
+  // identical doubles before remesh_intersections deduplicates vertices.
+  (void)slow_and_more_precise;
+  return assign_scalar(rhs,lhs);
 }
 
 template <>
@@ -70,15 +57,72 @@ IGL_INLINE void igl::copyleft::cgal::assign_scalar(
   const CGAL::Epeck::FT & _cgal,
   double & d)
 {
+  const auto double_to_ord = [](double x) -> std::uint64_t {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &x, sizeof(double));
+    return (bits & (1ULL << 63)) ? ~bits : (bits | (1ULL << 63));
+  };
+  const auto ord_to_double = [](std::uint64_t ord) -> double {
+    const std::uint64_t bits =
+      (ord & (1ULL << 63)) ? (ord & ~(1ULL << 63)) : ~ord;
+    double x = 0.0;
+    std::memcpy(&x, &bits, sizeof(double));
+    return x;
+  };
+
   // FORCE evaluation of the exact type otherwise interval might be huge.
-  const CGAL::Epeck::FT cgal = _cgal.exact();
-  const auto interval = CGAL::to_interval(cgal);
-  d = interval.first;
-  do {
-      const double next = nextafter(d, interval.second);
-      if (CGAL::abs(cgal-d) < CGAL::abs(cgal-next)) break;
-      d = next;
-  } while (d < interval.second);
+  const auto & exact = _cgal.exact();
+  if (CGAL::is_zero(exact)) {
+    d = 0.0;
+    return;
+  }
+
+  const auto interval = CGAL::to_interval(exact);
+  const double lo_bound = std::isfinite(interval.first)
+                            ? interval.first
+                            : -std::numeric_limits<double>::max();
+  const double hi_bound = std::isfinite(interval.second)
+                            ? interval.second
+                            : std::numeric_limits<double>::max();
+
+  if (lo_bound >= hi_bound) {
+    d = (lo_bound == 0.0) ? 0.0 : lo_bound;
+    return;
+  }
+
+  std::uint64_t lo = double_to_ord(lo_bound);
+  std::uint64_t hi = double_to_ord(hi_bound);
+
+  // Binary search across the IEEE-754 lattice guarantees <= 64 exact comparisons
+  // even when Quotient<MP_Float>::to_interval overflows to [-inf, +inf].
+  while (hi - lo > 1ULL) {
+    const std::uint64_t mid = lo + (hi - lo) / 2ULL;
+    const double mid_d = ord_to_double(mid);
+    const CGAL::Comparison_result cmp = CGAL::compare(exact, mid_d);
+    if (cmp == CGAL::LARGER) {
+      lo = mid;
+    } else if (cmp == CGAL::SMALLER) {
+      hi = mid;
+    } else {
+      d = (mid_d == 0.0) ? 0.0 : mid_d;
+      return;
+    }
+  }
+
+  const double d_lo = ord_to_double(lo);
+  const double d_hi = ord_to_double(hi);
+  const CGAL::Comparison_result cmp =
+    CGAL::compare(CGAL::abs(exact - d_lo), CGAL::abs(exact - d_hi));
+  if (cmp == CGAL::SMALLER) {
+    d = d_lo;
+  } else if (cmp == CGAL::LARGER) {
+    d = d_hi;
+  } else {
+    std::uint64_t bits_lo = 0;
+    std::memcpy(&bits_lo, &d_lo, sizeof(double));
+    d = ((bits_lo & 1ULL) == 0ULL) ? d_lo : d_hi;
+  }
+  if (d == 0.0) d = 0.0;
 }
 
 IGL_INLINE void igl::copyleft::cgal::assign_scalar(

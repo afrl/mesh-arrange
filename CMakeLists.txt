@@ -26,6 +26,8 @@ option(MESHARRANGE_INSTALL
 
 set(MESHARRANGE_CGAL_INCLUDE_DIR "" CACHE PATH
     "Optional path to header-only CGAL include directory if find_package(CGAL) is unavailable")
+set(MESHARRANGE_GMSH_ROOT "" CACHE PATH
+    "Optional prefix containing Gmsh SDK (include/gmsh.h and lib/libgmsh*) for end-to-end Gmsh CTest suite")
 
 # ==============================================================================
 # Private Dependencies (Eigen3, CGAL + Boost + GMP/MPFR, Threads)
@@ -92,10 +94,31 @@ if(NOT WIN32)
             list(APPEND _mesh_arrange_cgal_defs CGAL_USE_GMPXX=1)
         endif()
     else()
+        message(WARNING
+            "MeshArrange: GMP/MPFR not found; falling back to CGAL_DISABLE_GMP "
+            "(CGAL::Quotient<CGAL::MP_Float>). High-multiplicity (K >= 4) surface "
+            "arrangements will be orders of magnitude slower without GMP.")
         list(APPEND _mesh_arrange_cgal_defs CGAL_DISABLE_GMP=1 CGAL_USE_BOOST_MP=1)
     endif()
 else()
-    list(APPEND _mesh_arrange_cgal_defs CGAL_DISABLE_GMP=1 CGAL_USE_BOOST_MP=1)
+    find_path(MESHARRANGE_GMP_INCLUDE_DIR NAMES gmp.h)
+    find_library(MESHARRANGE_GMP_LIBRARY NAMES gmp mpir)
+    find_path(MESHARRANGE_MPFR_INCLUDE_DIR NAMES mpfr.h)
+    find_library(MESHARRANGE_MPFR_LIBRARY NAMES mpfr)
+    if(MESHARRANGE_GMP_INCLUDE_DIR AND MESHARRANGE_GMP_LIBRARY AND
+       MESHARRANGE_MPFR_INCLUDE_DIR AND MESHARRANGE_MPFR_LIBRARY)
+        list(APPEND _mesh_arrange_cgal_includes
+             "${MESHARRANGE_GMP_INCLUDE_DIR}"
+             "${MESHARRANGE_MPFR_INCLUDE_DIR}")
+        list(APPEND _mesh_arrange_cgal_libs
+             "${MESHARRANGE_MPFR_LIBRARY}"
+             "${MESHARRANGE_GMP_LIBRARY}")
+    else()
+        message(WARNING
+            "MeshArrange: GMP/MPFR not found on Windows; falling back to "
+            "CGAL_DISABLE_GMP (CGAL::Quotient<CGAL::MP_Float>).")
+        list(APPEND _mesh_arrange_cgal_defs CGAL_DISABLE_GMP=1 CGAL_USE_BOOST_MP=1)
+    endif()
 endif()
 
 # ==============================================================================
@@ -119,6 +142,7 @@ set(MESHARRANGE_PUBLIC_HEADERS
     include/mesh_arrange/QualityTriangulation.h
     include/mesh_arrange/MeshArrange.h
     include/mesh_arrange/GmshModelBuilder.h
+    include/mesh_arrange/GmshSdkAdapter.h
 )
 
 set(MESHARRANGE_SOURCES
@@ -216,6 +240,22 @@ if(MESHARRANGE_BUILD_TESTS)
     if(MESHARRANGE_WITH_TETGEN)
         mesh_arrange_add_test(test_consistent_and_features tests/test_consistent_and_features.cpp)
         mesh_arrange_add_test(test_interpenetration_cases tests/test_interpenetration_cases.cpp)
+    endif()
+
+    find_path(MESHARRANGE_GMSH_INCLUDE_DIR
+        NAMES gmsh.h
+        HINTS "${MESHARRANGE_GMSH_ROOT}/include" "${MESHARRANGE_GMSH_ROOT}"
+    )
+    find_library(MESHARRANGE_GMSH_LIBRARY
+        NAMES gmsh libgmsh.so.4.15 libgmsh.so.4.14 libgmsh.so.4.13 libgmsh.so
+        HINTS "${MESHARRANGE_GMSH_ROOT}/lib" "${MESHARRANGE_GMSH_ROOT}/lib64" "${MESHARRANGE_GMSH_ROOT}"
+    )
+    if(MESHARRANGE_GMSH_INCLUDE_DIR AND MESHARRANGE_GMSH_LIBRARY)
+        get_filename_component(_gmsh_lib_dir "${MESHARRANGE_GMSH_LIBRARY}" DIRECTORY)
+        mesh_arrange_add_test(test_gmsh_sdk_integration tests/test_gmsh_sdk_integration.cpp)
+        target_include_directories(test_gmsh_sdk_integration PRIVATE "${MESHARRANGE_GMSH_INCLUDE_DIR}")
+        target_link_libraries(test_gmsh_sdk_integration PRIVATE "${MESHARRANGE_GMSH_LIBRARY}")
+        set_target_properties(test_gmsh_sdk_integration PROPERTIES BUILD_RPATH "${_gmsh_lib_dir}")
     endif()
 endif()
 
