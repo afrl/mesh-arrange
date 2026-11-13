@@ -1,10 +1,14 @@
 #include "mesh_arrange/MeshArrange.h"
 
 #include "detail/MathHelpers.h"
+#include "igl/copyleft/cgal/remesh_self_intersections.h"
 #include "mesh_arrange/GlobalOptions.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <limits>
+#include <map>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -487,6 +491,267 @@ void build_brep_topology(const SegmentedTetrahedralization& st, ArrangeResult& r
     }
 }
 
+/// Collapses sub-tolerance floating-point rounding edges (`<= 1e-12 * bbox_diag`, e.g. `2.45e-17`
+/// from `cos(pi/2)` vs `0.0`) left after exact-to-double projection in `create_consistent_surface`,
+/// preventing degenerate collinear triangles during downstream edge splits and 3D boundary recovery.
+void weld_sub_ulp_consistent_edges(const CombinedSurfaces& combined, ConsistentSurfaces& consistent)
+{
+    auto& mesh = consistent.consistent_surface_mesh;
+    if (mesh.vertices.size() < 3 || mesh.triangles.empty())
+    {
+        return;
+    }
+
+    Point3 bmin = mesh.vertices.front();
+    Point3 bmax = mesh.vertices.front();
+    for (const auto& p : mesh.vertices)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            bmin[k] = std::min(bmin[k], p[k]);
+            bmax[k] = std::max(bmax[k], p[k]);
+        }
+    }
+    const double dx   = bmax[0] - bmin[0];
+    const double dy   = bmax[1] - bmin[1];
+    const double dz   = bmax[2] - bmin[2];
+    const double diag = std::max(std::sqrt(dx * dx + dy * dy + dz * dz), 1.0);
+    const double tol2 = (1e-12 * diag) * (1e-12 * diag);
+
+    const std::size_t n_raw = mesh.vertices.size();
+    std::vector<Index> uf_par(n_raw);
+    for (std::size_t i = 0; i < n_raw; ++i)
+    {
+        uf_par[i] = static_cast<Index>(i);
+    }
+    auto uf_find = [&](Index x) -> Index
+    {
+        while (uf_par[x] != x)
+        {
+            uf_par[x] = uf_par[uf_par[x]];
+            x         = uf_par[x];
+        }
+        return x;
+    };
+    auto zero_coord_score = [&](Index v) -> int
+    {
+        int s = 0;
+        for (int k = 0; k < 3; ++k)
+        {
+            if (mesh.vertices[v][k] == 0.0)
+            {
+                ++s;
+            }
+        }
+        return s;
+    };
+
+    bool any_welded = false;
+    for (const auto& tr : mesh.triangles)
+    {
+        for (int e = 0; e < 3; ++e)
+        {
+            const Index ra = uf_find(tr[e]);
+            const Index rb = uf_find(tr[(e + 1) % 3]);
+            if (ra == rb)
+            {
+                continue;
+            }
+            const double ex = mesh.vertices[ra][0] - mesh.vertices[rb][0];
+            const double ey = mesh.vertices[ra][1] - mesh.vertices[rb][1];
+            const double ez = mesh.vertices[ra][2] - mesh.vertices[rb][2];
+            if (ex * ex + ey * ey + ez * ez <= tol2)
+            {
+                const int sa    = zero_coord_score(ra);
+                const int sb    = zero_coord_score(rb);
+                const Index rep = (sa > sb || (sa == sb && ra < rb)) ? ra : rb;
+                const Index oth = (rep == ra) ? rb : ra;
+                uf_par[oth]     = rep;
+                any_welded      = true;
+            }
+        }
+    }
+    if (!any_welded)
+    {
+        return;
+    }
+
+    const ConsistentSurfaces backup = consistent;
+
+    // Map original facet -> object ID for priority-aware coplanar facet merging
+    std::size_t n_orig_facets = 0;
+    for (const auto& fvec : combined.object_to_facets_map)
+    {
+        for (const FacetID fid : fvec)
+        {
+            n_orig_facets = std::max<std::size_t>(n_orig_facets, static_cast<std::size_t>(fid) + 1);
+        }
+    }
+    std::vector<Index> orig_facet_to_obj(n_orig_facets, 0);
+    for (std::size_t oid = 0; oid < combined.object_to_facets_map.size(); ++oid)
+    {
+        for (const FacetID fid : combined.object_to_facets_map[oid])
+        {
+            orig_facet_to_obj[fid] = static_cast<Index>(oid);
+        }
+    }
+
+    std::unordered_map<std::size_t, FacetID> facet_hash_map;
+    auto& f2orig = consistent.consistent_facet_to_inconsistent_facets_map;
+    for (std::size_t fid = 0; fid < f2orig.size(); ++fid)
+    {
+        std::vector<FacetID> max_p_facets;
+        PriorityType max_p = std::numeric_limits<PriorityType>::min();
+        for (const FacetID ofid : f2orig[fid])
+        {
+            max_p = std::max(max_p, combined.object_priorities[orig_facet_to_obj[ofid]]);
+        }
+        for (const FacetID ofid : f2orig[fid])
+        {
+            if (combined.object_priorities[orig_facet_to_obj[ofid]] == max_p)
+            {
+                max_p_facets.push_back(ofid);
+            }
+        }
+        facet_hash_map.emplace(detail::hash_sorted_container(max_p_facets),
+                               static_cast<FacetID>(fid));
+    }
+
+    auto merge_two_markers = [&](Marker ma, Marker mb) -> Marker
+    {
+        if (ma == mb)
+        {
+            return ma;
+        }
+        std::vector<FacetID> all_orig = f2orig[ma];
+        all_orig.insert(all_orig.end(), f2orig[mb].begin(), f2orig[mb].end());
+        std::sort(all_orig.begin(), all_orig.end());
+        all_orig.erase(std::unique(all_orig.begin(), all_orig.end()), all_orig.end());
+
+        PriorityType max_p = std::numeric_limits<PriorityType>::min();
+        for (const FacetID ofid : all_orig)
+        {
+            max_p = std::max(max_p, combined.object_priorities[orig_facet_to_obj[ofid]]);
+        }
+        std::vector<FacetID> max_p_facets;
+        for (const FacetID ofid : all_orig)
+        {
+            if (combined.object_priorities[orig_facet_to_obj[ofid]] == max_p)
+            {
+                max_p_facets.push_back(ofid);
+            }
+        }
+        const std::size_t h = detail::hash_sorted_container(max_p_facets);
+        const auto it       = facet_hash_map.find(h);
+        if (it != facet_hash_map.end())
+        {
+            return it->second;
+        }
+        const FacetID new_fid = static_cast<FacetID>(f2orig.size());
+        f2orig.push_back(std::move(all_orig));
+        facet_hash_map.emplace(h, new_fid);
+        return new_fid;
+    };
+
+    std::vector<Index> raw_to_clean(n_raw, NOT_SET_Index);
+    std::vector<Point3> clean_verts;
+    clean_verts.reserve(n_raw);
+    for (std::size_t i = 0; i < n_raw; ++i)
+    {
+        const Index r = uf_find(static_cast<Index>(i));
+        if (raw_to_clean[r] == NOT_SET_Index)
+        {
+            raw_to_clean[r] = static_cast<Index>(clean_verts.size());
+            clean_verts.push_back(mesh.vertices[r]);
+        }
+        raw_to_clean[i] = raw_to_clean[r];
+    }
+
+    std::map<std::array<Index, 3>, Index> seen_tris;
+    std::vector<std::array<Index, 3>> clean_tris;
+    std::vector<Marker> clean_markers;
+    clean_tris.reserve(mesh.triangles.size());
+    clean_markers.reserve(mesh.triangles.size());
+
+    const double min_area2 = (1e-15 * diag * diag) * (1e-15 * diag * diag);
+    for (std::size_t ti = 0; ti < mesh.triangles.size(); ++ti)
+    {
+        const Index c0 = raw_to_clean[mesh.triangles[ti][0]];
+        const Index c1 = raw_to_clean[mesh.triangles[ti][1]];
+        const Index c2 = raw_to_clean[mesh.triangles[ti][2]];
+        if (c0 == c1 || c1 == c2 || c2 == c0)
+        {
+            continue;
+        }
+        const Point3& A = clean_verts[c0];
+        const Point3& B = clean_verts[c1];
+        const Point3& C = clean_verts[c2];
+        const double nx = (B[1] - A[1]) * (C[2] - A[2]) - (B[2] - A[2]) * (C[1] - A[1]);
+        const double ny = (B[2] - A[2]) * (C[0] - A[0]) - (B[0] - A[0]) * (C[2] - A[2]);
+        const double nz = (B[0] - A[0]) * (C[1] - A[1]) - (B[1] - A[1]) * (C[0] - A[0]);
+        if (nx * nx + ny * ny + nz * nz <= min_area2)
+        {
+            continue;
+        }
+
+        std::array<Index, 3> key = { c0, c1, c2 };
+        std::sort(key.begin(), key.end());
+        const Marker m = mesh.tri_to_marker_map[ti];
+        const auto it  = seen_tris.find(key);
+        if (it == seen_tris.end())
+        {
+            seen_tris.emplace(key, static_cast<Index>(clean_tris.size()));
+            clean_tris.push_back({ c0, c1, c2 });
+            clean_markers.push_back(m);
+        }
+        else
+        {
+            clean_markers[it->second] = merge_two_markers(clean_markers[it->second], m);
+        }
+    }
+
+    if (clean_tris.empty())
+    {
+        consistent = backup;
+        return;
+    }
+
+    // Verify exact CGAL intersection-freedom after welding
+    Eigen::MatrixXd V(static_cast<Eigen::Index>(clean_verts.size()), 3);
+    for (std::size_t i = 0; i < clean_verts.size(); ++i)
+    {
+        V(static_cast<Eigen::Index>(i), 0) = clean_verts[i][0];
+        V(static_cast<Eigen::Index>(i), 1) = clean_verts[i][1];
+        V(static_cast<Eigen::Index>(i), 2) = clean_verts[i][2];
+    }
+    Eigen::MatrixXi F(static_cast<Eigen::Index>(clean_tris.size()), 3);
+    for (std::size_t i = 0; i < clean_tris.size(); ++i)
+    {
+        F(static_cast<Eigen::Index>(i), 0) = static_cast<int>(clean_tris[i][0]);
+        F(static_cast<Eigen::Index>(i), 1) = static_cast<int>(clean_tris[i][1]);
+        F(static_cast<Eigen::Index>(i), 2) = static_cast<int>(clean_tris[i][2]);
+    }
+    igl::copyleft::cgal::RemeshSelfIntersectionsParam params;
+    params.detect_only = true;
+    params.first_only  = true;
+    params.stitch_all  = false;
+    Eigen::MatrixXd VV;
+    Eigen::MatrixXi FF, IF;
+    Eigen::VectorXi J, IM;
+    igl::copyleft::cgal::remesh_self_intersections(V, F, params, VV, FF, IF, J, IM);
+    if (IF.rows() > 0)
+    {
+        consistent = backup;
+        return;
+    }
+
+    mesh.vertices          = std::move(clean_verts);
+    mesh.triangles         = std::move(clean_tris);
+    mesh.tri_to_marker_map = std::move(clean_markers);
+    mesh.n_markers         = static_cast<Marker>(f2orig.size());
+    update_edges_and_maps(mesh);
+}
+
 } // namespace
 
 ArrangeResult arrange_surfaces(const std::vector<InputSurface>& surfaces,
@@ -507,6 +772,7 @@ ArrangeResult arrange_surfaces(const std::vector<InputSurface>& surfaces,
     }
 
     ConsistentSurfaces consistent = create_consistent_surface(combined);
+    weld_sub_ulp_consistent_edges(combined, consistent);
     SegmentedTetrahedralization st =
       identify_features(combined, consistent, options.plc_tetrahedralizer);
 
@@ -516,20 +782,29 @@ ArrangeResult arrange_surfaces(const std::vector<InputSurface>& surfaces,
         return result;
     }
 
-    if (options.remove_overlaps && !st.object_region_info.regions_of_overlap.empty())
+    const bool resolved_overlaps =
+      options.remove_overlaps && !st.object_region_info.regions_of_overlap.empty();
+    if (resolved_overlaps)
     {
         remove_interpenetrations(combined, consistent, st);
     }
 
     if (!options.optimize_surfaces)
     {
+        bool refined_after_overlap = false;
         if (options.split_constrained_seam_edges)
         {
             split_constrained_edges(st);
+            refined_after_overlap = true;
         }
         if (options.max_edge_length > 0.0)
         {
             split_large_edges(options.max_edge_length, st);
+            refined_after_overlap = true;
+        }
+        if (resolved_overlaps && refined_after_overlap)
+        {
+            smooth_medial_surfaces(consistent, st);
         }
     }
 
@@ -537,6 +812,10 @@ ArrangeResult arrange_surfaces(const std::vector<InputSurface>& surfaces,
     orient_segmented_surface_triangles_from_tets(st);
 
     RecoveredTriangulation rt = recover_triangulation(st);
+    if (resolved_overlaps)
+    {
+        polish_recovered_medial_surfaces(consistent, st, rt);
+    }
     if (options.optimize_surfaces)
     {
         optimize_recovered_triangulation(rt);
